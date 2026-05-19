@@ -348,7 +348,7 @@ if ($accounts instanceof Collection && $accounts->count() > 0) {
 
 **代码位置**：`app/Support/Http/Api/ExchangeRateConverter.php`
 
-#### 3.2.1 四级回退策略
+#### 3.2.1 四级回退策略与完整回退路径
 
 ```php
 // app/Support/Http/Api/ExchangeRateConverter.php:239-287
@@ -391,7 +391,36 @@ private function getRate(TransactionCurrency $from, TransactionCurrency $to, Car
 }
 ```
 
-#### 3.2.2 数据库查询逻辑
+> **完整回退路径分析（以查询日期早于所有汇率的场景）**：
+> 
+> ```
+> 汇率数据: [R1:2024-01-01, R2:2024-01-15, R3:2024-02-01]
+> 查询日期: 2023-12-01（早于所有汇率）
+> 
+> 回退路径:
+>   ↓ 第1级: Cache::get('cer-1-2-2023-12-01') → null（无缓存
+>   ↓ 第2级: getFromDB(USD, EUR, '2023-12-01')
+>          → where(date <= '2023-12-01') → 无匹配 → 返回 null
+>   ↓ 第3级: getFromDB(EUR, USD, '2023-12-01')
+>          → where(date <= '2023-12-01') → 无匹配 → 返回 null
+>   ↓ 第4级: getEuroRate(USD, '2023-12-01')
+>          → 同样因日期过旧 → 返回 '0'
+>          → 满足 (0 === bccomp('0', $first) → true
+>          → Log::warning(...) → 返回 '1'
+> 
+> 最终结果: 返回汇率 = 1（1:1 换算）
+> ```
+> 
+> **代码证据**：第 275-278 行明确处理无可用汇率时的兜底逻辑：
+> ```php
+> // app/Support/Http/Api/ExchangeRateConverter.php:275-278
+> if (0 === bccomp('0', $first) || 0 === bccomp('0', $second)) {
+>     Log::warning('There is not enough information to convert %s to %s on date %s', ...);
+>     return '1';  // 关键：无可用汇率时返回 1
+> }
+> ```
+
+#### 3.2.2 数据库查询逻辑与日期边界分析
 
 ```php
 // app/Support/Http/Api/ExchangeRateConverter.php:174-234
@@ -411,14 +440,15 @@ private function getFromDB(int $from, int $to, string $date): ?string
     $cache->addProperty(sprintf('cer-%d-%d-%s', $from, $to, $date));
     if ($cache->has()) { return $cache->get(); }
 
-    // 实际数据库查询：取日期前最新汇率
+    // 实际数据库查询：核心日期筛选逻辑
     $result = $this->userGroup
         ->currencyExchangeRates()
         ->where('from_currency_id', $from)
         ->where('to_currency_id', $to)
-        ->where('date', '<=', $date)    // 关键：日期 <= 查询日期
-        ->orderBy('date', 'DESC')       // 关键：倒序取最新
-        ->first();
+        ->where('date', '<=', $date)    // 关键1：只选择日期 <= 查询日期的汇率
+        ->orderBy('date', 'DESC')       // 关键2：按日期倒序（最新在前）
+        ->first()                       // 关键3：取第一条（最新可用汇率）
+    ;
     ++$this->queryCount;
 
     $rate = (string) $result?->rate;
@@ -431,6 +461,27 @@ private function getFromDB(int $from, int $to, string $date): ?string
     return $rate;
 }
 ```
+
+> **日期边界深度分析**：
+> 
+> 核心筛选条件是 `where('date', '<=', $date)` + `orderBy('date', 'DESC')` + `first()` 的组合：
+> 
+> ```
+> 时间轴 →
+> [R1:2024-01-01] [R2:2024-01-15] [R3:2024-02-01]
+>                                     ↑ 查询日期: 2024-02-15
+> ```
+> 
+> | 场景 | 查询日期 | 匹配逻辑 | 结果 |
+> |------|----------|----------|------|
+> | ① 查询日期在所有汇率之后 | 2024-02-15 | `date <= 2024-02-15` 匹配 R1,R2,R3，倒序取 R3 | ✅ 返回 R3（最新汇率） |
+> | ② 查询日期在汇率之间 | 2024-01-20 | `date <= 2024-01-20` 匹配 R1,R2，倒序取 R2 | ✅ 返回 R2（最近的历史汇率） |
+> | ③ 查询日期在所有汇率之前 | 2023-12-01 | `date <= 2023-12-01` 无匹配 | ❌ 返回 `null`，进入回退流程 |
+> 
+> **重要结论**：
+> - 当查询日期早于所有汇率时，**不会**取最早汇率，而是返回 `null`
+> - 返回 `null` 后会触发后续回退：反向查询 → EUR 三角换算 → 最终返回 `1`（1:1 换算）
+> - 这是一种保守策略：宁可 1:1 换算，也不使用未来的汇率（因为未来汇率不可知）
 
 #### 3.2.3 EUR 中介汇率查询
 
@@ -572,8 +623,9 @@ private function calculateTransactions(UserGroup $userGroup, TransactionCurrency
 | 源货币 = 目标货币 | 返回汇率 = 1 | `ExchangeRateConverter.php:88-91` |
 | 无任何可用汇率 | 返回汇率 = 1（1:1 换算） | `ExchangeRateConverter.php:276-278` |
 | 汇率为 0 | 视为无效，继续回退 | `ExchangeRateConverter.php:220-224` |
-| 查询日期早于所有汇率 | 取最早可用汇率（`orderBy('date', 'DESC')->first()`） | `ExchangeRateConverter.php:208-210` |
-| 查询日期晚于所有汇率 | 取最新可用汇率 | `ExchangeRateConverter.php:208-210` |
+| 查询日期早于所有汇率 | **不匹配任何记录**，返回 `null`，进入回退流程，最终返回 1 | `ExchangeRateConverter.php:218-219` |
+| 查询日期在汇率之间 | 取查询日期前最近的历史汇率（倒序取第一条） | `ExchangeRateConverter.php:219-221` |
+| 查询日期晚于所有汇率 | 取最新可用汇率（倒序取第一条） | `ExchangeRateConverter.php:219-221` |
 | 外币恰好是本位币 | 直接使用 `foreign_amount`，无需换算 | `TransactionSummarizer.php:81-89` |
 
 ### 4.4 金额计算边界
