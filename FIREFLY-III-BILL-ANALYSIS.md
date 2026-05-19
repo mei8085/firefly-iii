@@ -1065,29 +1065,139 @@ private function needsWarning(Bill $bill, string $field): bool
 ```php
 private function needsOverdueAlert(array $dates): bool
 {
+    // 分支1：数量判断
     $count    = count($dates['pay_dates']) - count($dates['paid_dates']);
-    if (0 === $count || 0 === count($dates['pay_dates']) {
-        return false;
+    if (0 === $count || 0 === count($dates['pay_dates'])) {
+        return false;  // 没有未支付账单，不提醒
     }
+    
+    // 分支2：日期判断
     $earliest = new Carbon($dates['pay_dates'][0]);
     $earliest->startOfDay();
-    $diff     = $earliest->diffInDays($this->date);
-    return $diff >= 6;
+    $diff     = $earliest->diffInDays($this->date);  // Carbon::diffInDays 返回绝对值
+    return $diff >= 6;  // 超过6天才触发逾期提醒
 }
 ```
 
-逾期提醒的边界行为：
+**完整分支分析**：
 
-| 日期场景 | 应付款日期 | diff 值 | 是否触发 | 说明 |
-|---------|------------|---------|----------|------|
-| **未来日期** | 2026-05-20（明天） | 1 | ❌ 不触发 | 还未到付款日 |
-| **当日** | 2026-05-19（今天） | 0 | ❌ 不触发 | 当天不触发（宽容期） |
-| **历史日期** | 2026-05-18（1天前） | 1 | ❌ 不触发 | 1-5天为宽容期 |
-| **历史日期** | 2026-05-14（5天前） | 5 | ❌ 不触发 | 仍在宽容期内 |
-| **历史日期** | 2026-05-13（6天前） | 6 | ✅ 触发 | 超过宽容期，触发逾期提醒 |
-| **历史日期** | 2026-04-19（30天前） | 30 | ✅ 触发 | 严重逾期，触发提醒 |
+| 分支 | 判断条件 | 返回值 | 说明 |
+|------|----------|--------|------|
+| 分支1 | `count(pay_dates) == 0` | `false` | 本期无预期支付日期（可能账单刚创建或已全部支付） |
+| 分支1 | `count(pay_dates) - count(paid_dates) == 0` | `false` | 所有预期支付日期都已完成支付 |
+| 分支2 | `diff < 6` | `false` | 最早应付款日期距今不足6天（含未来日期、当日、近5天） |
+| 分支2 | `diff >= 6` | `true` | 最早应付款日期距今超过6天，触发逾期提醒 |
 
-#### 4.7.4 支付日期范围的边界行为
+**逾期提醒的边界行为（结合时间范围过滤）**：
+
+由于 `pay_dates` 是通过 `getPayDates($start, $end, ...)` 计算的，其中 `$start` 和 `$end` 是**当期**时间范围（如月度账单为当月1日至当月最后一日），因此：
+
+| 日期场景 | 应付款日期 | 是否在当期范围内 | diff 值 | 是否触发 | 说明 |
+|---------|------------|------------------|---------|----------|------|
+| **未来日期** | 2026-06-10（下月） | ❌ 不在 | - | ❌ 不触发 | 不在当期范围内，不会出现在 pay_dates 中 |
+| **未来日期** | 2026-05-20（明天，当月） | ✅ 在 | 1（绝对值） | ❌ 不触发 | diff < 6，不满足阈值 |
+| **未来日期** | 2026-05-13（6天后，当月） | ✅ 在 | 6（绝对值） | ✅ 触发 | 未来日期也会触发！因 diffInDays 返回绝对值 |
+| **当日** | 2026-05-19（今天） | ✅ 在 | 0 | ❌ 不触发 | diff < 6 |
+| **历史日期** | 2026-05-18（1天前） | ✅ 在 | 1 | ❌ 不触发 | diff < 6（宽容期） |
+| **历史日期** | 2026-05-14（5天前） | ✅ 在 | 5 | ❌ 不触发 | diff < 6（宽容期） |
+| **历史日期** | 2026-05-13（6天前） | ✅ 在 | 6 | ✅ 触发 | diff >= 6，超过宽容期 |
+| **历史日期** | 2026-04-19（30天前，上月） | ❌ 不在 | - | ❌ 不触发 | 不在当期范围内，不会出现在 pay_dates 中 |
+
+> **重要发现**：由于 `Carbon::diffInDays()` 返回绝对值，**未来超过6天的应付款日期也会触发逾期提醒**！
+> 例如：如果今天是5月13日，而当期应付款日期是5月19日（6天后），`diff = 6`，会触发逾期提醒。
+> 这是一个潜在的逻辑缺陷，逾期提醒应该只针对历史日期（已过付款日但未支付）。
+
+**未来日期不触发的唯一情况**：
+
+未来日期不触发逾期提醒的**唯一**原因是：该日期**不在当期时间范围内**（如下月的账单不在当月范围内），因此不会出现在 `pay_dates` 数组中。
+
+如果未来日期在当期范围内（如当月19日，今天是当月13日），且距离 ≥ 6天，**会误触发逾期提醒**。
+
+#### 4.7.4 pay_dates 与 paid_dates 的语义及在逾期判断中的作用
+
+##### 语义定义
+
+**证据代码1：paid_dates 来源（实际支付记录）**：`app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php:294-353`
+
+```php
+private function collectPaidDates(): void
+{
+    // 查询数据库中已关联该账单的交易记录
+    $filtered = $set->filter(static fn (TransactionJournal $journal): bool => 
+        (int) $journal->bill_id === (int) $subscription->id
+    );
+    
+    foreach ($filtered as $entry) {
+        $result[] = [
+            'date' => $entry->date->toAtomString(),  // 实际支付日期
+            'transaction_journal_id' => (string) $entry->id,
+            // ... 其他交易信息
+        ];
+    }
+    $this->paidDates[(int) $subscription->id] = $result;
+}
+```
+
+**证据代码2：pay_dates 来源（预测支付日期）**：`app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php:356-386`
+
+```php
+private function collectPayDates(): void
+{
+    // 获取最后一次支付日期
+    $lastPaidDate = $this->getLastPaidDate($this->paidDates[$id] ?? []);
+    
+    // 使用 BillDateCalculator 计算预期支付日期
+    $payDates = $this->calculator->getPayDates(
+        $this->start,       // 周期开始日
+        $this->end,         // 周期结束日
+        $subscription->date, // 账单起始日
+        $subscription->repeat_freq, // 重复频率
+        $subscription->skip, // 跳过周期数
+        $lastPaidDate      // 最后支付日期（用于过滤已支付的日期）
+    );
+    $this->payDates[$id] = $payDatesFormatted;
+}
+```
+
+**语义总结表**：
+
+| 字段 | 来源 | 语义 | 数据类型 |
+|------|------|------|----------|
+| `paid_dates` | 数据库查询（已关联账单的交易） | **实际已支付**的交易日期列表，包含交易详情 | 数组（每个元素是包含 date、transaction_journal_id 等的对象） |
+| `pay_dates` | BillDateCalculator 计算（基于账单频率预测） | **预期应支付**的日期列表，是预测值，不含实际交易 | 数组（每个元素是日期字符串，格式如 "2026-05-19T00:00:00+00:00"） |
+
+##### 在逾期判断中的作用
+
+**证据代码**：`app/Jobs/WarnAboutBills.php:158-172`
+
+```php
+private function needsOverdueAlert(array $dates): bool
+{
+    // 未支付数量 = 预期支付日期数 - 实际支付日期数
+    $count    = count($dates['pay_dates']) - count($dates['paid_dates']);
+    
+    if (0 === $count || 0 === count($dates['pay_dates'])) {
+        return false;  // 没有未支付账单，不提醒
+    }
+    
+    // 最早预期支付日期
+    $earliest = new Carbon($dates['pay_dates'][0]);
+    $earliest->startOfDay();
+    
+    // 计算最早预期支付日距离今天的天数
+    $diff     = $earliest->diffInDays($this->date);
+    
+    return $diff >= 6;  // 超过6天才触发逾期提醒
+}
+```
+
+**应付未付的判断逻辑**：
+
+1.  **数量判断**：`count(pay_dates) > count(paid_dates)` 表示存在应付未付
+2.  **日期判断**：最早的 `pay_dates` 日期距离今天 ≥ 6 天
+3.  **应付未付 = pay_dates 中存在但 paid_dates 中不存在的日期**
+
+**时间范围的边界**：
 
 **证据代码**：`app/Jobs/WarnAboutBills.php:117-132`
 
@@ -1104,36 +1214,81 @@ private function getDates(Bill $bill): array
 
 `Navigation::startOfPeriod` 和 `endOfPeriod` 根据账单的重复频率确定时间范围：
 
-| 重复频率 | 起始日期 | 结束日期 |
-|---------|----------|----------|
-| monthly | 当月1日 | 当月最后一日 |
-| weekly | 当周周一 | 当周周日 |
-| yearly | 当年1月1日 | 当年12月31日 |
+| 重复频率 | 起始日期（start） | 结束日期（end） |
+|---------|------------------|----------------|
+| daily | 今日00:00 | 今日23:59 |
+| weekly | 当周周一00:00 | 当周周日23:59 |
+| monthly | 当月1日00:00 | 当月最后一日23:59 |
+| quarterly | 当季首月1日00:00 | 当季末月最后一日23:59 |
+| half-year | 最近的1月/7月1日00:00 | 最近的6月/12月最后一日23:59 |
+| yearly | 当年1月1日00:00 | 当年12月31日23:59 |
+
+**证据代码**：`app/Support/Navigation.php:651-724`（startOfPeriod）、`app/Support/Navigation.php:185-265`（endOfPeriod）
 
 这意味着：
 
-- **月度账单**：只检查**当期的支付情况
-- **如果当期账单已经支付**：不会出现在 paid_dates 中，不会触发逾期提醒
+- **月度账单**：只检查**当期**（当月）的支付情况
+- **如果当期账单已经支付**：出现在 paid_dates 中，`count(paid_dates)` 增加，不触发逾期提醒
 - **如果当期账单未支付**：出现在 pay_dates 中但不在 paid_dates 中，会触发逾期提醒
+- **lastPaidDate 过滤**：`getPayDates()` 的 `$lastPaidDate` 参数确保已支付的日期不会出现在 pay_dates 中
 
 #### 4.7.5 防重复提醒的边界行为
 
 ##### 到期提醒的边界：
 
-到期提醒没有内置的用户偏好开关控制，但**不会记录已提醒状态，只要满足 `diff` 在配置列表中，每次运行都会提醒。
+到期提醒**受 `notification_bill_reminder` 偏好开关控制**，但不会记录已提醒状态，只要满足 `diff` 在配置列表中且开关打开，每次运行都会提醒。
 
-**证据代码**：`app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php:42-49`
+**触发与拦截路径证据**：
+
+**证据代码1：触发路径（事件发送）**：`app/Jobs/WarnAboutBills.php:194-199`
 
 ```php
-$preference = Preferences::getForUser(
-    $event->subscription->user,
-    'notification_bill_reminder',
-    true
-)->data;
+private function sendWarning(Bill $bill, string $field): void
+{
+    $diff = $this->getDiff($bill, $field);
+    Log::debug('Will now send warning!');
+    event(new SubscriptionNeedsExtensionOrRenewal($bill, $field, $diff));
+}
+```
+
+**证据代码2：拦截路径（用户偏好检查）**：`app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php:36-51`
+
+```php
+public function handle(SubscriptionNeedsExtensionOrRenewal $event): void
+{
+    $subscription = $event->subscription;
+    
+    /** @var bool $preference */
+    $preference   = Preferences::getForUser($subscription->user, 'notification_bill_reminder', true)->data;
+    
+    if (true === $preference) {
+        Log::debug('Subscription reminder is true!');
+        NotificationSender::send($subscription->user, new BillReminder($subscription, $event->field, $event->diff));
+        return;
+    }
+    Log::debug('User has disabled subscription reminders.');  // 用户关闭了提醒
+}
+```
+
+**完整触发与拦截路径**：
+
+```
+WarnAboutBills::handle()
+    ↓
+needsWarning() → true
+    ↓
+sendWarning() → 触发 SubscriptionNeedsExtensionOrRenewal 事件
+    ↓
+NotifiesAboutExtensionOrRenewal::handle()
+    ↓
+检查 notification_bill_reminder 偏好
+    ├─ true → 发送 BillReminder 通知
+    └─ false → 拦截，记录日志 "User has disabled subscription reminders."
 ```
 
 这意味着：
-- 如果用户启用提醒，每次满足条件时每次运行都会提醒
+- 如果用户启用提醒（默认true），每次满足条件时都会提醒
+- 如果用户关闭提醒，所有到期提醒都会被拦截
 - 没有去重机制，可能导致重复提醒
 - 依赖 Cron 12小时间隔控制，每天最多提醒2次
 
@@ -1167,10 +1322,12 @@ $key = sprintf(
 
 #### 4.7.7 边界行为总结表
 
-| 提醒类型 | 历史日期 | 当日 | 未来日期 | 去重机制 |
-|---------|----------|------|----------|----------|
-| **到期提醒** | ✅ 会触发（diff 绝对值匹配 | ✅ 会触发（diff=0） | ✅ 会触发（diff 匹配配置） | 用户偏好开关（无去重） |
-| **逾期提醒** | ✅ 超过6天触发 | ❌ 不触发 | ❌ 不触发 | 哈希去重（基于 pay_dates） |
+| 提醒类型 | 历史日期 | 当日 | 未来日期 | 去重/拦截机制 |
+|---------|----------|------|----------|--------------|
+| **到期提醒** | ✅ 会触发（diff 绝对值匹配配置列表） | ✅ 会触发（diff=0） | ✅ 会触发（diff 匹配配置列表） | `notification_bill_reminder` 偏好开关（无去重，每次满足条件都提醒） |
+| **逾期提醒** | ✅ 在当期范围内且超过6天触发 | ❌ 不触发（diff=0 < 6） | ⚠️  在当期范围内且超过6天**会误触发**（因 diffInDays 返回绝对值）；不在当期范围内不触发 | 哈希去重（基于 pay_dates 哈希），同一期账单只提醒一次 |
+
+> **注意**：逾期提醒对未来日期的误触发是潜在 Bug，原因是 `Carbon::diffInDays()` 返回绝对值，且代码中没有判断 `$earliest` 是否在过去。
 
 ---
 
@@ -1256,9 +1413,10 @@ $key = sprintf(
 2.  **月末日期修正 Bug**：`BillDateCalculator.php:112` 行 `subDays()` 缺少参数，应该是 `subDays($diffEOM)`
 3.  **到期提醒重复问题**：由于 `diffInDays()` 返回绝对值，导致历史日期也会触发到期提醒，可能造成过度提醒
 4.  **到期提醒无去重**：到期提醒没有去重机制，满足条件时每次运行都会提醒
-5.  **提醒频率**：当前到期提醒是一次性的（仅在配置日当天），可考虑增加频率选项
-6.  **批量优化**：`SubscriptionEnrichment` 单条处理，批量场景可优化
-7.  **Ntfy 支持**：代码中已注释 Ntfy 渠道，可考虑恢复
+5.  **逾期提醒未来日期误触发**：`WarnAboutBills.php:177` 使用 `diffInDays()` 返回绝对值，且没有判断 `$earliest` 是否在过去，导致未来超过6天的应付款日期也会误触发逾期提醒
+6.  **提醒频率**：当前到期提醒是一次性的（仅在配置日当天），可考虑增加频率选项
+7.  **批量优化**：`SubscriptionEnrichment` 单条处理，批量场景可优化
+8.  **Ntfy 支持**：代码中已注释 Ntfy 渠道，可考虑恢复
 
 ---
 
