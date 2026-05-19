@@ -398,30 +398,33 @@ private function getRate(TransactionCurrency $from, TransactionCurrency $to, Car
 >   - 数据库汇率: [R1:2024-01-01, R2:2024-01-15, R3:2024-02-01] （USD→EUR）
 >   - 查询日期: 2023-12-01（早于所有汇率）
 >   - 配置文件: cer.rates.USD = 1.1349044 （EUR→USD 的静态备份汇率）
+>   - 货币ID: USD=1, EUR=2
 > 
 > 回退路径:
 > ┌───────────────────────────────────────────────────────────┐
 > │ 第1级: Laravel 缓存                                       │
-> │   Cache::get('cer-USD-EUR-2023-12-01') → null（无缓存）    │
+> │   🔹 缓存键: sprintf('cer-%d-%d-%s', 1, 2, '2023-12-01')  │
+> │      → 'cer-1-2-2023-12-01'（使用货币ID，而非代码）        │
+> │   Cache::get('cer-1-2-2023-12-01') → null（无缓存）        │
 > └───────────────────────┬───────────────────────────────────┘
 >                         ↓
 > ┌───────────────────────────────────────────────────────────┐
 > │ 第2级: 数据库正向查询 (USD → EUR)                         │
-> │   getFromDB(USD, EUR, '2023-12-01')                       │
+> │   getFromDB(1, 2, '2023-12-01')                           │
 > │   → where(date <= '2023-12-01') → 无匹配 → 返回 null       │
 > └───────────────────────┬───────────────────────────────────┘
 >                         ↓
 > ┌───────────────────────────────────────────────────────────┐
 > │ 第3级: 数据库反向查询 (EUR → USD)                         │
-> │   getFromDB(EUR, USD, '2023-12-01')                       │
+> │   getFromDB(2, 1, '2023-12-01')                           │
 > │   → where(date <= '2023-12-01') → 无匹配 → 返回 null       │
 > └───────────────────────┬───────────────────────────────────┘
 >                         ↓
 > ┌───────────────────────────────────────────────────────────┐
 > │ 第4级: EUR 三角换算（关键！备份汇率在此生效）               │
 > │   getEuroRate(USD, '2023-12-01')                          │
-> │   ├─ 正向查询: getFromDB(USD, EUR, '2023-12-01') → null   │
-> │   ├─ 反向查询: getFromDB(EUR, USD, '2023-12-01') → null   │
+> │   ├─ 正向查询: getFromDB(1, 2, '2023-12-01') → null       │
+> │   ├─ 反向查询: getFromDB(2, 1, '2023-12-01') → null       │
 > │   ├─ 🔹 备份汇率: config('cer.rates.USD') = 1.1349044     │
 > │   │     → 返回 bcdiv('1', '1.1349044') = 0.8811...        │
 > │   └─ 返回: 0.881131...（非零！）                           │
@@ -429,13 +432,23 @@ private function getRate(TransactionCurrency $from, TransactionCurrency $to, Car
 > │   getEuroRate(EUR, '2023-12-01')                          │
 > │   └─ 同货币直接返回: '1'                                  │
 > │                                                           │
-> │   检查: 0 === bccomp('0', '0.8811...') → false ✅         │
+> │   🔹 检查: 0 === bccomp('0', '0.8811...') → false ✅       │
 > │        0 === bccomp('0', '1') → false ✅                   │
 > │   计算: bcmul('0.8811...', bcdiv('1', '1')) = 0.8811...    │
 > └───────────────────────┬───────────────────────────────────┘
 >                         ↓
 > 最终结果: 返回汇率 = 0.881131...（使用配置中的备份汇率，而非 1:1）
 > ```
+> 
+> **缓存键实现确认**：
+> ```php
+> // app/Support/Http/Api/ExchangeRateConverter.php:116-119
+> private function getCacheKey(TransactionCurrency $from, TransactionCurrency $to, Carbon $date): string
+> {
+>     return sprintf('cer-%d-%d-%s', $from->id, $to->id, $date->format('Y-m-d'));
+> }
+> ```
+> 缓存键格式：`cer-{from_id}-{to_id}-{date}`，使用**货币 ID**而非货币代码，确保跨系统货币重命名时缓存一致性。
 > 
 > **关键分支详解**：
 > 
@@ -451,19 +464,35 @@ private function getRate(TransactionCurrency $from, TransactionCurrency $to, Car
 > 
 > **何时会回落到 1:1 汇率？**
 > 
-> 必须同时满足以下条件：
-> 1. ✅ 查询日期早于所有数据库汇率（正向/反向查询均返回 null）
-> 2. ✅ 配置文件 `cer.rates` 中**没有**该货币的备份汇率
-> 3. ✅ 三角换算失败（`getEuroRate` 返回 `'0'`）
+> **核心判断逻辑是"或"条件**：只要**任意一侧**货币无法获取有效汇率，即触发 1:1 回落：
 > 
-> 代码证据：
 > ```php
-> // app/Support/Http/Api/ExchangeRateConverter.php:275-278
+> // app/Support/Http/Api/ExchangeRateConverter.php:271-279
+> $first  = $this->getEuroRate($from, $date);  // 源货币 → EUR 的汇率
+> $second = $this->getEuroRate($to, $date);    // 目标货币 → EUR 的汇率
+> 
+> // 🔴 关键：OR 条件！任意一侧为 0 即回落
 > if (0 === bccomp('0', $first) || 0 === bccomp('0', $second)) {
 >     Log::warning('There is not enough information to convert %s to %s on date %s', ...);
->     return '1';  // 仅当三角换算失败时才返回 1
+>     return '1';
 > }
 > ```
+> 
+> **完整触发条件**：
+> 
+> | 货币对 | 源货币 (from) | 目标货币 (to) | 结果 |
+> |--------|--------------|--------------|------|
+> | USD → EUR | 数据库/配置有汇率（≠0） | 同货币返回 1（≠0） | 正常换算 |
+> | USD → XAU | 数据库/配置有汇率（≠0） | 配置无 XAU 备份汇率（=0） | 🔴 回落 1:1 |
+> | BTC → ETH | 配置无 BTC 备份汇率（=0） | 配置无 ETH 备份汇率（=0） | 🔴 回落 1:1 |
+> | BTC → USD | 配置无 BTC 备份汇率（=0） | 数据库/配置有汇率（≠0） | 🔴 回落 1:1 |
+> 
+> **单侧货币回落到 1:1 的必要条件**（该侧货币需同时满足）：
+> 1. ✅ 查询日期早于所有数据库汇率（正向/反向查询均返回 null）
+> 2. ✅ 配置文件 `cer.rates` 中**没有**该货币的备份汇率
+> 3. ✅ `getEuroRate` 对该货币返回 `'0'`
+> 
+> 由于判断条件是 `||`（或），只要有**任意一侧**满足以上三点，就会触发 1:1 回落，无需双侧同时满足。
 > 
 > **配置文件中的备份汇率**（`config/cer.php:34-79`）：
 > ```php
@@ -683,15 +712,19 @@ private function calculateTransactions(UserGroup $userGroup, TransactionCurrency
 |----------|----------|----------|
 | 汇率功能全局禁用 | 直接返回原金额，不进行换算 | `ExchangeRateConverter.php:63-66` |
 | 源货币 = 目标货币 | 返回汇率 = 1 | `ExchangeRateConverter.php:88-91` |
-| 无任何可用汇率（含备份） | 返回汇率 = 1（1:1 换算） | `ExchangeRateConverter.php:275-278` |
+| 任意一侧货币无任何可用汇率（含备份） | **直接返回 1**（1:1 换算，或条件判断） | `ExchangeRateConverter.php:271-278` |
 | 汇率为 0 | 视为无效，继续回退 | `ExchangeRateConverter.php:220-224` |
-| 查询日期早于所有数据库汇率（主流货币） | 进入回退流程，**使用配置中的静态备份汇率**，而非 1:1 | `ExchangeRateConverter.php:161-168` |
-| 查询日期早于所有数据库汇率（小众货币） | 进入回退流程，配置无备份汇率，最终返回 1 | `ExchangeRateConverter.php:171, 275-278` |
+| 查询日期早于所有数据库汇率（主流货币对主流货币） | 双侧均有备份汇率，三角换算正常进行 | `ExchangeRateConverter.php:161-168` |
+| 查询日期早于所有数据库汇率（主流货币对小众货币） | 小众货币无备份汇率，触发或条件回落 1:1 | `ExchangeRateConverter.php:171, 275-278` |
+| 查询日期早于所有数据库汇率（小众货币对小众货币） | 双侧均无备份汇率，触发或条件回落 1:1 | `ExchangeRateConverter.php:171, 275-278` |
 | 查询日期在汇率之间 | 取查询日期前最近的历史汇率（倒序取第一条） | `ExchangeRateConverter.php:208-210` |
 | 查询日期晚于所有汇率 | 取最新可用汇率（倒序取第一条） | `ExchangeRateConverter.php:208-210` |
 | 外币恰好是本位币 | 直接使用 `foreign_amount`，无需换算 | `TransactionSummarizer.php:81-89` |
 
-> **特别说明**："早于所有汇率"的场景下，是否回落到 1:1 取决于该货币是否在 `config/cer.php` 的 `rates` 数组中有备份汇率。目前配置中包含约 30 种主流货币（USD, GBP, JPY, CNY 等）。
+> **特别说明**：
+> - 缓存键格式：`cer-{from_id}-{to_id}-{date}`，使用**货币 ID**而非货币代码（`ExchangeRateConverter.php:116-119`）
+> - 1:1 回落条件是 **OR 逻辑**：`if (0 === bccomp('0', $first) || 0 === bccomp('0', $second))`，只要任意一侧无汇率即触发
+> - 目前 `config/cer.php` 的 `rates` 数组中包含约 30 种主流货币（USD, GBP, JPY, CNY 等）的备份汇率
 
 ### 4.4 金额计算边界
 
@@ -755,11 +788,13 @@ private function calculateTransactions(UserGroup $userGroup, TransactionCurrency
 
 1. **双轨存储**：原始金额 + 本位币预换算金额，兼顾准确性与性能
 2. **多重缓存**：请求内缓存 + 属性缓存 + Laravel 缓存，三级缓存策略
-3. **渐进回退**：汇率查询从直接匹配 → 反向匹配 → EUR 三角换算 → 配置备份汇率，五级回退确保可用性
+3. **渐进回退**：汇率查询从缓存命中 → 正向查询 → 反向查询 → EUR 三角换算 → 配置备份汇率，五级回退确保可用性
 4. **保守策略**：查询日期早于所有汇率时，不使用未来汇率，而是优先使用配置中的静态备份汇率
 5. **分层兜底**：主流货币通过配置备份汇率兜底，小众货币才回落到 1:1 换算，平衡准确性和可用性
-6. **时间精度**：所有日期比较使用明确的时间边界（00:00:00 / 23:59:59）
-7. **安全计算**：全部使用 `bc*` 系列函数进行任意精度数学运算，避免浮点误差
+6. **单侧失效**：1:1 回落采用 OR 逻辑，任意一侧货币无可用汇率即触发，避免半有效汇率导致的计算错误
+7. **ID 级缓存**：缓存键使用货币 ID 而非代码，确保货币重命名时缓存一致性
+8. **时间精度**：所有日期比较使用明确的时间边界（00:00:00 / 23:59:59）
+9. **安全计算**：全部使用 `bc*` 系列函数进行任意精度数学运算，避免浮点误差
 
 ---
 
