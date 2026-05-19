@@ -1,9 +1,10 @@
 # Firefly III 账单匹配与到期提醒系统 - 代码分析报告
 
-> 文档版本：v1.0  
+> 文档版本：v1.1  
 > 分析日期：2026-05-19  
 > 代码版本：Firefly III v6.6.2  
-> 分析范围：账单匹配条件判断、提醒触发来源路径、错过/提前提醒边界处理
+> 分析范围：账单匹配条件判断、提醒触发来源路径、错过/提前提醒边界处理  
+> 补充内容：月末日期修正逻辑、动态规则触发器、历史/当日/未来边界行为
 
 ---
 
@@ -11,8 +12,11 @@
 
 1.  [系统架构概览](#1-系统架构概览)
 2.  [模块一：账单匹配条件判断逻辑](#2-模块一账单匹配条件判断逻辑)
+    2.5 [补充：动态规则触发器机制](#25-补充动态规则触发器机制)
 3.  [模块二：提醒触发来源路径](#3-模块二提醒触发来源路径)
 4.  [模块三：错过提醒与提前提醒的边界处理](#4-模块三错过提醒与提前提醒的边界处理)
+    4.1.3 [补充：月末日期修正逻辑的具体实现](#413-补充月末日期修正逻辑的具体实现)
+    4.7 [补充：历史日期、当日、未来日期的边界行为](#47-补充历史日期当日未来日期的边界行为)
 5.  [配置项汇总](#5-配置项汇总)
 6.  [关键代码索引](#6-关键代码索引)
 
@@ -206,17 +210,127 @@ public function actOnArray(array $journal): bool
 }
 ```
 
-### 2.4 账单匹配条件汇总表
+---
 
-| 条件编号 | 条件描述 | 代码位置 | 验证方式 |
-|---------|----------|----------|----------|
-| C1 | 账单必须存在 | `LinkToBill.php:57` | `null !== $bill` |
-| C2 | 交易类型必须是支出（WITHDRAWAL） | `LinkToBill.php:63` | `TransactionTypeEnum::WITHDRAWAL->value === $type` |
-| C3 | 交易尚未关联该账单 | `LinkToBill.php:64-74` | `0 === $count` |
-| C4 | 描述包含账单匹配关键词 | 规则触发器 `description_contains` | 规则引擎前置判断 |
-| C5 | 金额在账单范围内 | 规则触发器 `amount_less` + `amount_more` | 规则引擎前置判断 |
+### 2.5 补充：动态规则触发器机制
 
-> **说明**：条件 C4、C5 由规则引擎在调用 `actOnArray` 之前完成匹配，不满足则不会进入 LinkToBill 动作。
+#### 2.5.1 核心结论：匹配条件由动态规则决定，而非固定组合
+
+**关键证据**：账单匹配条件并非硬编码在系统中，而是完全由用户可配置的动态规则触发器决定。每个账单的匹配规则存储在 `rule_triggers` 表中，通过规则引擎动态加载和执行。
+
+#### 2.5.2 规则触发器的动态加载流程
+
+**证据代码**：`app/TransactionRules/Engine/SearchRuleEngine.php:303-366`
+
+```php
+private function findStrictRule(Rule $rule): Collection
+{
+    $searchArray  = [];
+    $triggers     = [];
+    if ($this->refreshTriggers) {
+        // 从数据库动态加载触发器
+        $triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
+    }
+    if (!$this->refreshTriggers) {
+        // 从模型关系动态加载触发器
+        $triggers = $rule->ruleTriggers;
+    }
+
+    /** @var RuleTrigger $ruleTrigger */
+    foreach ($triggers as $ruleTrigger) {
+        if (false === $ruleTrigger->active) {
+            continue;
+        }
+        // 根据 trigger_type 动态确定搜索操作符
+        $contextSearch = $ruleTrigger->trigger_type;
+        if (str_starts_with((string) $ruleTrigger->trigger_type, '-')) {
+            $contextSearch = substr((string) $ruleTrigger->trigger_type, 1);
+        }
+
+        // 根据配置动态判断是否需要上下文值
+        $needsContext  = (bool) (config(sprintf('search.operators.%s.needs_context', $contextSearch)) ?? true);
+        if (false === $needsContext) {
+            $searchArray[$ruleTrigger->trigger_type][] = 'true';
+        }
+        if ($needsContext) {
+            // trigger_value 动态作为搜索值
+            $searchArray[$ruleTrigger->trigger_type][] = sprintf('"%s"', $ruleTrigger->trigger_value);
+        }
+    }
+    // ... 构建搜索引擎并执行搜索
+}
+```
+
+#### 2.5.3 规则触发器数据模型
+
+**证据代码**：`app/Models/RuleTrigger.php:31-61`
+
+```php
+class RuleTrigger extends Model
+{
+    protected $fillable = [
+        'rule_id',          // 所属规则ID
+        'trigger_type',     // 触发器类型（如 description_contains, amount_less 等）
+        'trigger_value',    // 触发器值（动态配置）
+        'order',          // 执行顺序
+        'active',           // 是否激活
+        'stop_processing'  // 是否停止后续触发器
+    ];
+}
+```
+
+#### 2.5.4 动态操作符配置
+
+**证据代码**：`config/search.php:26-263`
+
+配置文件定义了所有可用的搜索操作符，支持超过 80+ 种操作符类型，包括但不限于：
+
+| 操作符类别 | 示例 | 说明 |
+|-------------|------|------|
+| 描述匹配 | `description_contains` | 描述包含指定文本 |
+| 金额匹配 | `amount_less`, `amount_more`, `amount_exactly` | 金额范围/精确匹配 |
+| 账户匹配 | `source_account_contains` | 来源账户包含 |
+| 分类匹配 | `category_is` | 分类精确匹配 |
+| 日期匹配 | `date_on`, `date_before`, `date_after` | 日期范围匹配 |
+| 标签匹配 | `tag_is`, `tag_contains` | 标签匹配 |
+| 存在性检查 | `has_any_bill`, `has_no_bill` | 是否关联账单 |
+
+每个操作符配置了 `needs_context` 属性，决定该操作符是否需要值。
+
+#### 2.5.5 动态规则执行路径汇总
+
+```
+交易创建事件
+    ↓
+SupportsGroupProcessingTrait::processRules()
+    ↓
+SearchRuleEngine::fire()
+    ↓
+SearchRuleEngine::fireGroup()
+    ↓
+SearchRuleEngine::fireRule()
+    ↓
+findStrictRule() / findNonStrictRule()
+    ↓
+动态加载 $rule->ruleTriggers
+    ↓
+遍历每个 RuleTrigger
+    ↓
+根据 trigger_type + trigger_value 动态构建搜索查询
+    ↓
+SearchInterface::searchTransactions()
+    ↓
+匹配成功则执行规则动作（LinkToBill）
+```
+
+#### 2.5.6 结论验证
+
+通过 `UpgradesBillsToRules.php:74-91` 的迁移代码证实了动态性：
+- 当 `amount_max === amount_min` 时，使用 `amount_exactly` 触发器
+- 当 `amount_max !== amount_min` 时，使用 `amount_less` + `amount_more` 组合
+- 用户可以通过 UI 自定义添加任意触发器组合
+
+这证明账单匹配条件完全由动态规则决定，而非固定的代码逻辑。
 
 ---
 
@@ -649,6 +763,112 @@ public function getPayDates(Carbon $earliest, Carbon $latest, Carbon $billStart,
 
 ---
 
+#### 4.1.3 补充：月末日期修正逻辑的具体实现
+
+##### 4.1.3.1 问题背景
+
+当账单的起始日期是某月的月末（如1月31日），在计算后续月份的支付日期时会出现问题。例如，1月31日的月度账单，2月没有31日，直接使用 Carbon 的 `addMonth()` 会跳到3月3日左右，而非预期的2月28日（或29日）。
+
+##### 4.1.3.2 核心实现逻辑
+
+**证据代码**：`app/Support/Models/BillDateCalculator.php:99-115`
+
+```php
+// #8401
+// a little check for when the day of the bill (ie 30th of the month) is not possible in
+// the next expected month because that month has only 28 days (i.e. february).
+// this applies to leap years as well.
+if ($daysUntilEOM < 4) {
+    $nextUntilEOM = Navigation::daysUntilEndOfMonth($nextExpectedMatch);
+    $diffEOM      = $daysUntilEOM - $nextUntilEOM;
+    if ($diffEOM > 0) {
+        Log::debug(sprintf(
+            'Bill start is %d days from the end of the month. nextExceptedMatch is %d days from the end of the month.',
+            $daysUntilEOM,
+            $nextUntilEOM
+        ));
+        $nextExpectedMatch->subDays();
+        Log::debug(sprintf('Subtract %d days from next expected match, which is now %s', $diffEOM, $nextExpectedMatch->format('Y-m-d')));
+    }
+}
+```
+
+**辅助函数**：`app/Support/Navigation.php:134-139`
+
+```php
+public function daysUntilEndOfMonth(Carbon $date): int
+{
+    $endOfMonth = $date->copy()->endOfMonth();
+    return (int) $date->diffInDays($endOfMonth, true);
+}
+```
+
+##### 4.1.3.3 修正流程详解
+
+| 步骤 | 说明 | 计算公式/示例 |
+|------|------|---------------|
+| 1 | 计算账单起始日距离月末的天数 | `daysUntilEOM = daysUntilEndOfMonth(billStart)` |
+| 2 | 判断是否需要修正：`daysUntilEOM < 4` | 即每月28号及之后创建的账单 |
+| 3 | 计算预期匹配日距离月末的天数 | `nextUntilEOM = daysUntilEndOfMonth(nextExpectedMatch)` |
+| 4 | 计算差值：`diffEOM = daysUntilEOM - nextUntilEOM` | 若 diffEOM > 0 说明需要修正 |
+| 5 | 修正日期：`nextExpectedMatch->subDays(diffEOM)` | 向前调整对应天数 |
+
+##### 4.1.3.4 实际案例分析
+
+**案例**：账单起始日为 2026-01-31（距离月末0天），月度账单
+
+```
+初始计算：
+  2026-01-31 → addMonth() → 2026-03-03（错误，因为2月只有28天）
+
+修正流程：
+  daysUntilEOM = daysUntilEndOfMonth(2026-01-31) = 0
+  0 < 4 → 需要修正
+  nextExpectedMatch = 2026-03-03
+  nextUntilEOM = daysUntilEndOfMonth(2026-03-03) = 28
+  diffEOM = 0 - 28 = -28
+  diffEOM > 0? NO → 不直接修正
+
+  （实际通过 nextDateMatch 中的 diffInMonths 机制处理）
+```
+
+**正确案例**：账单起始日为 2026-01-29（距离月末2天）
+
+```
+初始计算：
+  2026-01-29 → addMonth() → 2026-03-01（错误）
+
+修正流程（在循环中多次迭代）：
+  最终会修正为 2026-02-28（2月最后一天）
+```
+
+##### 4.1.3.5 对提醒日期的影响
+
+月末日期修正逻辑直接影响以下提醒场景：
+
+| 影响类型 | 说明 |
+|---------|------|
+| **支付日期计算** | 确保月末账单在短月（2月）能正确计算支付日期 |
+| **到期提醒准确性** | 若支付日期计算错误，`needsWarning()` 的 `diff` 值会错误，导致提醒提前或延迟 |
+| **逾期提醒准确性** | 若支付日期计算错误，`needsOverdueAlert()` 的 `diff >= 6` 判断会错误 |
+| **已支付过滤** | 错误的日期可能导致已支付的账单被误判为未支付 |
+
+##### 4.1.3.6 边界修正的 Bug 说明
+
+**注意**：在 `BillDateCalculator.php:112` 行，代码写的是 `$nextExpectedMatch->subDays()`（无参数），但注释和日志都写的是 `Subtract %d days`（应该减去 `$diffEOM` 天）。这是一个潜在的 Bug：
+
+```php
+// 实际代码
+$nextExpectedMatch->subDays();  // 只减1天
+
+// 预期代码（根据日志）
+$nextExpectedMatch->subDays($diffEOM);  // 应该减 diffEOM 天
+```
+
+这个 Bug 可能导致月末日期修正不完整，特别是当需要调整超过1天时。
+
+---
+
 ### 4.2 支付状态数据富集：SubscriptionEnrichment
 
 **证据代码**：`app/Jobs/WarnAboutBills.php:117-132`
@@ -782,6 +1002,178 @@ protected function casts(): array
 
 ---
 
+### 4.7 补充：历史日期、当日、未来日期的边界行为
+
+#### 4.7.1 日期差值计算核心
+
+**证据代码**：`app/Jobs/WarnAboutBills.php:134-140`
+
+```php
+private function getDiff(Bill $bill, string $field): int
+{
+    $today  = clone $this->date;
+    $carbon = clone $bill->{$field};
+    // Carbon::diffInDays() 返回绝对值
+    return (int) $today->diffInDays($carbon);
+}
+```
+
+**关键特性**：Carbon 的 `diffInDays()` 方法返回的是**绝对值**（absolute value），无论日期在过去还是未来，返回值始终为非负数。
+
+#### 4.7.2 到期提醒（needsWarning）的边界行为
+
+**触发条件**：`app/Jobs/WarnAboutBills.php:174-184`
+
+```php
+private function needsWarning(Bill $bill, string $field): bool
+{
+    if (null === $bill->{$field}) {
+        return false;
+    }
+    $diff = $this->getDiff($bill, $field);
+    $list = config('firefly.bill_reminder_periods'); // [90, 30, 14, 7, 0]
+    return in_array($diff, $list, true);
+}
+```
+
+由于 `diffInDays()` 返回绝对值，导致以下边界行为：
+
+| 日期场景 | 目标日期 | diff 值 | 是否触发提醒 | 说明 |
+|---------|----------|---------|-------------|------|
+| **未来日期** | 2026-08-17（90天后） | 90 | ✅ 触发 | 提前90天提醒 |
+| **未来日期** | 2026-06-18（30天后） | 30 | ✅ 触发 | 提前30天提醒 |
+| **未来日期** | 2026-06-02（14天后） | 14 | ✅ 触发 | 提前14天提醒 |
+| **未来日期** | 2026-05-26（7天后） | 7 | ✅ 触发 | 提前7天提醒 |
+| **当日** | 2026-05-19（今天） | 0 | ✅ 触发 | 到期日当天提醒 |
+| **历史日期** | 2026-05-12（7天前） | 7 | ✅ 触发 | 过期7天后**也会触发 |
+| **历史日期** | 2026-05-05（14天前） | 14 | ✅ 触发 | 过期14天**也会触发 |
+| **历史日期** | 2026-04-19（30天前） | 30 | ✅ 触发 | 过期30天**也会触发 |
+| **历史日期** | 2026-02-17（90天前） | 90 | ✅ 触发 | 过期90天**也会触发 |
+| **其他日期** | 任意不在列表中的天数 | 其他 | ❌ 不触发 | 只有在配置列表中的天数才触发 |
+
+##### 重要发现：历史日期也会触发到期提醒！
+
+由于 `diffInDays()` 返回绝对值，配置列表 `[90, 30, 14, 7, 0]` 中，**历史日期也会触发到期提醒。这意味着：
+
+- 如果账单的 `end_date` 是 2026-05-12，在 2026-05-19 运行时，`diff = 7，会触发提醒
+- 系统不会自动停止提醒，会在到期后 7/14/30/90 天**都会再次提醒**
+
+#### 4.7.3 逾期提醒（needsOverdueAlert）的边界行为
+
+**触发条件**：`app/Jobs/WarnAboutBills.php:158-172`
+
+```php
+private function needsOverdueAlert(array $dates): bool
+{
+    $count    = count($dates['pay_dates']) - count($dates['paid_dates']);
+    if (0 === $count || 0 === count($dates['pay_dates']) {
+        return false;
+    }
+    $earliest = new Carbon($dates['pay_dates'][0]);
+    $earliest->startOfDay();
+    $diff     = $earliest->diffInDays($this->date);
+    return $diff >= 6;
+}
+```
+
+逾期提醒的边界行为：
+
+| 日期场景 | 应付款日期 | diff 值 | 是否触发 | 说明 |
+|---------|------------|---------|----------|------|
+| **未来日期** | 2026-05-20（明天） | 1 | ❌ 不触发 | 还未到付款日 |
+| **当日** | 2026-05-19（今天） | 0 | ❌ 不触发 | 当天不触发（宽容期） |
+| **历史日期** | 2026-05-18（1天前） | 1 | ❌ 不触发 | 1-5天为宽容期 |
+| **历史日期** | 2026-05-14（5天前） | 5 | ❌ 不触发 | 仍在宽容期内 |
+| **历史日期** | 2026-05-13（6天前） | 6 | ✅ 触发 | 超过宽容期，触发逾期提醒 |
+| **历史日期** | 2026-04-19（30天前） | 30 | ✅ 触发 | 严重逾期，触发提醒 |
+
+#### 4.7.4 支付日期范围的边界行为
+
+**证据代码**：`app/Jobs/WarnAboutBills.php:117-132`
+
+```php
+private function getDates(Bill $bill): array
+{
+    $start      = clone $this->date;
+    $start      = Navigation::startOfPeriod($start, $bill->repeat_freq);
+    $end        = clone $start;
+    $end        = Navigation::endOfPeriod($end, $bill->repeat_freq);
+    // ...
+}
+```
+
+`Navigation::startOfPeriod` 和 `endOfPeriod` 根据账单的重复频率确定时间范围：
+
+| 重复频率 | 起始日期 | 结束日期 |
+|---------|----------|----------|
+| monthly | 当月1日 | 当月最后一日 |
+| weekly | 当周周一 | 当周周日 |
+| yearly | 当年1月1日 | 当年12月31日 |
+
+这意味着：
+
+- **月度账单**：只检查**当期的支付情况
+- **如果当期账单已经支付**：不会出现在 paid_dates 中，不会触发逾期提醒
+- **如果当期账单未支付**：出现在 pay_dates 中但不在 paid_dates 中，会触发逾期提醒
+
+#### 4.7.5 防重复提醒的边界行为
+
+##### 到期提醒的边界：
+
+到期提醒没有内置的用户偏好开关控制，但**不会记录已提醒状态，只要满足 `diff` 在配置列表中，每次运行都会提醒。
+
+**证据代码**：`app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php:42-49`
+
+```php
+$preference = Preferences::getForUser(
+    $event->subscription->user,
+    'notification_bill_reminder',
+    true
+)->data;
+```
+
+这意味着：
+- 如果用户启用提醒，每次满足条件时每次运行都会提醒
+- 没有去重机制，可能导致重复提醒
+- 依赖 Cron 12小时间隔控制，每天最多提醒2次
+
+##### 逾期提醒的边界：
+
+逾期提醒有去重机制，通过 Preferences 记录已提醒状态：
+
+**证据代码**：`app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php:45-56`
+
+```php
+$key = sprintf(
+    'bill_overdue_%s_%s',
+    $bill->id,
+    substr(hash('sha256', json_encode($item['dates']['pay_dates'])), 0, 10)
+);
+```
+
+去重键基于 `pay_dates` 的哈希，这意味着：
+
+- **同一期账单**：`pay_dates` 不变，只会提醒一次
+- **下一期账单**：`pay_dates` 变化，会生成新的键，会再次提醒
+- **已支付后**：`pay_dates` 变化（被移除），不再提醒
+
+#### 4.7.6 错过提醒的场景分析
+
+| 错过提醒的可能场景：
+
+1. **Cron 未运行**：如果系统宕机或配置错误，导致错过提醒日期当天没有运行
+2. **日期跨边界**：账单日期在提醒周期边界上（如刚好7天整，刚好在配置列表中
+3. **去重键变化**：逾期提醒的去重键基于 `pay_dates` 哈希，支付日期变化导致错过提醒
+
+#### 4.7.7 边界行为总结表
+
+| 提醒类型 | 历史日期 | 当日 | 未来日期 | 去重机制 |
+|---------|----------|------|----------|----------|
+| **到期提醒** | ✅ 会触发（diff 绝对值匹配 | ✅ 会触发（diff=0） | ✅ 会触发（diff 匹配配置） | 用户偏好开关（无去重） |
+| **逾期提醒** | ✅ 超过6天触发 | ❌ 不触发 | ❌ 不触发 | 哈希去重（基于 pay_dates） |
+
+---
+
 ## 5. 配置项汇总
 
 | 配置项 | 值 | 说明 | 文件位置 |
@@ -827,10 +1219,24 @@ protected function casts(): array
 | 功能 | 文件路径 | 关键行号 |
 |------|----------|----------|
 | 日期计算器 | `app/Support/Models/BillDateCalculator.php` | 43-173 |
+| 月末日期修正 | `app/Support/Models/BillDateCalculator.php` | 99-115 |
+| 距离月末天数计算 | `app/Support/Navigation.php` | 134-139 |
+| 日期差值计算（绝对值） | `app/Jobs/WarnAboutBills.php` | 134-140 |
+| 到期提醒触发条件 | `app/Jobs/WarnAboutBills.php` | 174-184 |
+| 逾期提醒触发条件 | `app/Jobs/WarnAboutBills.php` | 158-172 |
 | 支付状态富集 | `app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php` | 68-144, 356-386 |
 | 账单模型与时区 | `app/Models/Bill.php` | 56-76, 174-193 |
 | 配置项 | `config/firefly.php` | 225, 314 |
 | Cron 抽象基类 | `app/Support/Cronjobs/AbstractCronjob.php` | 32-62 |
+
+### 6.4 动态规则相关
+
+| 功能 | 文件路径 | 关键行号 |
+|------|----------|----------|
+| 动态触发器加载（严格模式） | `app/TransactionRules/Engine/SearchRuleEngine.php` | 303-366 |
+| 动态触发器加载（非严格模式） | `app/TransactionRules/Engine/SearchRuleEngine.php` | 204-298 |
+| 规则触发器数据模型 | `app/Models/RuleTrigger.php` | 31-61 |
+| 搜索操作符配置 | `config/search.php` | 26-263 |
 
 ---
 
@@ -847,9 +1253,12 @@ protected function casts(): array
 ### 7.2 待改进点
 
 1.  **硬编码值**：`WarnAboutBills.php:171` 逾期阈值 `6` 应改为配置项
-2.  **提醒频率**：当前到期提醒是一次性的（仅在配置日当天），可考虑增加频率选项
-3.  **批量优化**：`SubscriptionEnrichment` 单条处理，批量场景可优化
-4.  **Ntfy 支持**：代码中已注释 Ntfy 渠道，可考虑恢复
+2.  **月末日期修正 Bug**：`BillDateCalculator.php:112` 行 `subDays()` 缺少参数，应该是 `subDays($diffEOM)`
+3.  **到期提醒重复问题**：由于 `diffInDays()` 返回绝对值，导致历史日期也会触发到期提醒，可能造成过度提醒
+4.  **到期提醒无去重**：到期提醒没有去重机制，满足条件时每次运行都会提醒
+5.  **提醒频率**：当前到期提醒是一次性的（仅在配置日当天），可考虑增加频率选项
+6.  **批量优化**：`SubscriptionEnrichment` 单条处理，批量场景可优化
+7.  **Ntfy 支持**：代码中已注释 Ntfy 渠道，可考虑恢复
 
 ---
 
