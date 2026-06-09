@@ -181,9 +181,168 @@ $webhookMessage->save();
 }
 ```
 
+### 3.6 不同预算事件的消息内容差异
+
+预算相关的三类事件（普通预算更新、预算删除、预算限额变更）虽然最终投递的都是预算类数据，但在触发时机、传入对象和消息内容上存在差异。
+
+#### 普通预算更新（STORE_BUDGET / UPDATE_BUDGET）
+
+- **触发对象**：`Budget` 模型实例
+- **触发器**：`STORE_BUDGET` 或 `UPDATE_BUDGET`
+- **content 数据源**：`BudgetTransformer` 对 Budget 模型进行转换
+- **数据特点**：包含预算的基本信息（名称、活跃状态、币种等），通过 `BudgetEnrichment` 进行数据补充后输出
+
+#### 预算删除（DESTROY_BUDGET）
+
+- **触发时机**：删除前触发（`DestroyingBudget` 事件），确保消息生成时模型数据仍然存在
+- **触发对象**：`Budget` 模型实例（删除前的完整数据）
+- **触发器**：`DESTROY_BUDGET`
+- **content 数据源**：与预算更新相同，使用 `BudgetTransformer` 转换 Budget 模型
+- **数据特点**：消息中包含的是被删除预算的完整数据，接收方可以根据 `trigger = DESTROY_BUDGET` 判断这是删除通知
+
+> **注意**：预算删除使用的是 `DestroyingBudget`（进行时）事件而非 `DestroyedBudget`（完成时）事件，目的是在预算被真正删除前生成包含完整数据的 Webhook 消息。
+
+#### 预算限额变更（STORE_UPDATE_BUDGET_LIMIT）
+
+- **触发场景**：创建、更新、删除预算限额时均触发
+- **触发器**：统一为 `STORE_UPDATE_BUDGET_LIMIT`（三种操作共用同一个触发器，不做细分）
+- **触发对象**：**`Budget` 模型实例**（注意：不是 `BudgetLimit` 对象，而是所属的预算对象）
+- **content 数据源**：`BudgetTransformer` 对 Budget 模型进行转换
+- **数据特点**：消息中的 `content` 是预算（Budget）的数据，而非预算限额（BudgetLimit）的数据；接收方只能通过 `trigger = STORE_UPDATE_BUDGET_LIMIT` 知道是预算限额发生了变化，但无法从 content 中直接获取限额详情
+
+> **重要提示**：预算限额事件传入消息生成器的对象是 Budget 而非 BudgetLimit，这与直觉可能不同。如果 Webhook 的响应类型设置为 `BUDGET`，则 content 中输出的是预算信息；如果设置为 `RELEVANT`，也会自动映射到 `BUDGET` 响应，内容仍然是预算数据。目前无法通过 Webhook 直接获取预算限额的详细数据。
+
 ---
 
-## 四、投递队列与重试机制
+## 四、调度入口与投递触发
+
+Webhook 消息生成后，需要通过某种机制触发实际的投递流程。`WebhookMessagesRequestSending` 事件是投递流程的统一入口，它有四种触发方式，共同保障消息能够被及时、可靠地投递。
+
+### 4.1 四种调度入口的关系
+
+四种入口互为补充，形成了"主动推送 + 兜底保障"的多层投递机制：
+
+| 触发方式 | 实时性 | 可靠性 | 触发场景 |
+|---------|--------|--------|---------|
+| 业务保存后立即发布 | 最高 | 高 | 业务操作完成后立刻触发 |
+| 页面随机兜底 | 低（随机） | 中 | 用户浏览页面时随机触发，作为轻量级兜底 |
+| 手动触发接口 | 按需 | 高 | 用户通过 API 主动触发 |
+| 定时任务 | 低（10分钟） | 最高 | 周期性兜底，保证消息最终被投递 |
+
+### 4.2 业务保存后立即发布
+
+**机制说明**：在业务操作（创建/更新/删除交易、预算、预算限额等）完成后，立即发布 `WebhookMessagesRequestSending` 事件，触发投递。
+
+**触发位置**：散布在各个业务 Repository 或 Service 中：
+
+- **交易创建**：`TransactionGroupRepository::store()` 方法，创建交易组后立即触发
+- **交易克隆**：`GroupCloneService` 中，克隆交易组后触发
+- **交易删除**：`TransactionGroupDestroyService` 中，删除交易组后触发
+- **预算创建**：`BudgetRepository` 的创建方法中
+- **预算更新**：`BudgetRepository` 的更新方法中
+- **预算限额创建/更新/删除**：`BudgetLimitRepository` 的对应方法中
+
+**代码模式**：
+
+```php
+// 业务操作完成后，直接发布事件
+event(new CreatedSingleTransactionGroup($flags, $objects));
+event(new WebhookMessagesRequestSending());
+```
+
+**特点**：
+- 实时性最高，消息生成后几乎立即开始投递
+- 依赖业务代码显式调用，可能存在遗漏
+- 与监听器异步生成消息的模式配合：监听器生成消息，此处触发投递
+
+### 4.3 页面随机兜底（Lottery 机制）
+
+**机制说明**：用户访问 Web 页面时，以一定概率随机触发 `WebhookMessagesRequestSending` 事件。
+
+**触发位置**：基础控制器 `Controller` 的构造函数中的全局中间件内。
+
+**代码实现**：
+
+```php
+// lottery to send any remaining webhooks:
+if (7 === random_int(1, 30)) {
+    // trigger event to send them:
+    event(new WebhookMessagesRequestSending());
+}
+```
+
+**触发概率**：约 1/30（即约 3.3% 的页面请求会触发）
+
+**触发前提**：用户已登录（`auth()->check()`）
+
+**特点**：
+- 作为轻量级兜底机制，弥补定时任务间隔较长的问题
+- 无需额外的定时任务基础设施，利用正常的页面访问流量
+- 触发频率与用户活跃度相关：用户越活跃，触发越频繁
+- 不保证一定会触发，仅作为补充手段
+
+### 4.4 手动触发接口
+
+**机制说明**：提供 API 接口，允许用户或外部系统手动触发某个 Webhook 的投递。
+
+**接口位置**：`api/v1/webhooks/{webhook}/trigger/{transactionGroup}`
+
+**控制器**：`Webhook\ShowController::triggerTransaction()`
+
+**工作流程**：
+
+1. 接收 Webhook ID 和交易组 ID
+2. 遍历该 Webhook 配置的所有触发器
+3. 为每个触发器调用消息生成器，以指定的交易组为对象生成消息
+4. 生成消息后，立即发布 `WebhookMessagesRequestSending` 事件触发投递
+
+**代码关键片段**：
+
+```php
+// 遍历 webhook 的所有触发器
+foreach ($webhook->webhookTriggers as $trigger) {
+    $engine = app(MessageGeneratorInterface::class);
+    $engine->setUser(auth()->user());
+    $engine->setTrigger(WebhookTrigger::tryFrom((int) $trigger->key));
+    $engine->setObjects(new Collection()->push($group));
+    $engine->setWebhooks(new Collection()->push($webhook)); // 仅针对当前 webhook
+    $engine->generateMessages();
+}
+
+// 触发投递
+event(new WebhookMessagesRequestSending());
+```
+
+**特点**：
+- 按需触发，可用于测试或手动重发
+- 可以只针对特定 Webhook 生成消息（通过 `setWebhooks()` 指定）
+- 响应状态码为 204（无内容）
+
+### 4.5 定时任务（最可靠的兜底）
+
+**机制说明**：通过 Cron 定时任务周期性地触发 `WebhookMessagesRequestSending` 事件，确保所有待发送的消息最终都能被处理。
+
+**触发位置**：`WebhookCronjob` 定时任务
+
+**执行频率**：每 10 分钟一次（通过 `last_webhook_job` 配置项控制，间隔需大于 600 秒）
+
+**工作流程**：
+
+1. 读取上次执行时间戳
+2. 检查距上次执行是否超过 10 分钟
+3. 若是则发布 `WebhookMessagesRequestSending` 事件
+4. 更新上次执行时间
+
+**触发方式**：通过系统 Cron 调用 `cron` 命令，或访问 `/cron` 路由触发
+
+**特点**：
+- 最可靠的兜底机制，不依赖用户活动或业务代码
+- 间隔较长（10 分钟），实时性最差
+- 与前三种方式形成互补：立即发布保证实时性，定时任务保证最终可达性
+
+---
+
+## 五、投递队列与重试机制
 
 ### 4.1 整体架构
 
@@ -299,16 +458,16 @@ WebhookMessage::where('sent', true)
 
 ---
 
-## 五、签名机制
+## 六、签名机制
 
-### 5.1 职责边界
+### 6.1 职责边界
 
 - **发送端**：Firefly III 负责生成签名并放入请求头
 - **接收端**：外部系统负责验证签名的有效性
 
 本文档仅说明发送端的签名生成逻辑，并给出接收端验证的参考方法。
 
-### 5.2 发送端签名生成
+### 6.2 发送端签名生成
 
 发送端使用 `Sha3SignatureGenerator` 生成签名，算法为 **HMAC-SHA3-256**。
 
