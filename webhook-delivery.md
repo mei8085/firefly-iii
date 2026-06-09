@@ -7,68 +7,93 @@ Firefly III 的 Webhook 系统采用 **事件驱动 + 异步队列 + 定时重�
 - **事件触发层**：监听模型变更事件，生成 Webhook 消息
 - **消息生成层**：根据触发器类型和响应格式生成消息内容
 - **投递队列层**：通过 Laravel Queue 异步发送，结合 Cronjob 实现重试
-- **签名安全层**：使用 HMAC-SHA3-256 对请求进行签名校验
+- **签名安全层**：使用 HMAC-SHA3-256 对请求进行签名
 
 ---
 
-## 二、业务事件与触发器
+## 二、业务事件与触发条件
 
 ### 2.1 触发器类型（WebhookTrigger）
 
-Webhook 触发器定义在 [WebhookTrigger.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Enums/WebhookTrigger.php) 中，共 8 种触发器：
+Webhook 触发器枚举共定义了 8 种触发场景：
 
 | 枚举值 | 数值 | 触发场景 |
 |--------|------|----------|
-| `ANY` | 50 | 任意事件触发 |
+| `ANY` | 50 | 任意事件触发（通配） |
 | `STORE_TRANSACTION` | 100 | 创建交易时触发 |
 | `UPDATE_TRANSACTION` | 110 | 更新交易时触发 |
 | `DESTROY_TRANSACTION` | 120 | 删除交易时触发 |
 | `STORE_BUDGET` | 200 | 创建预算时触发 |
 | `UPDATE_BUDGET` | 210 | 更新预算时触发 |
 | `DESTROY_BUDGET` | 220 | 删除预算时触发 |
-| `STORE_UPDATE_BUDGET_LIMIT` | 230 | 创建/更新预算限额时触发 |
+| `STORE_UPDATE_BUDGET_LIMIT` | 230 | 创建/更新/删除预算限额时触发 |
 
-### 2.2 事件监听器
+### 2.2 交易类事件的触发条件
 
-业务事件通过三个监听器捕获并触发 Webhook 消息生成：
+交易类事件（创建、更新、删除交易）由三个监听器分别处理：
 
-#### 交易组事件监听器
-- [ProcessesNewTransactionGroup.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php)
-  - 监听 `CreatedSingleTransactionGroup`、`UserRequestedBatchProcessing` 事件
-  - 触发 `STORE_TRANSACTION` 触发器
-  
-- [ProcessesUpdatedTransactionGroup.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php)
-  - 监听 `UpdatedSingleTransactionGroup` 事件
-  - 触发 `UPDATE_TRANSACTION` 触发器
+- 创建交易：监听 `CreatedSingleTransactionGroup` 和 `UserRequestedBatchProcessing` 事件
+- 更新交易：监听 `UpdatedSingleTransactionGroup` 事件
+- 删除交易：监听 `DestroyedSingleTransactionGroup` 事件
 
-- [ProcessesDestroyedTransactionGroup.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesDestroyedTransactionGroup.php)
-  - 监听 `DestroyedSingleTransactionGroup` 事件
-  - 触发 `DESTROY_TRANSACTION` 触发器
+**触发控制方式：**
 
-#### 预算事件监听器
-- [ProcessesBudgets.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/Budget/ProcessesBudgets.php)
-  - 监听 `CreatedBudget`、`UpdatedBudget`、`DestroyingBudget` 事件
-  - 分别触发 `STORE_BUDGET`、`UPDATE_BUDGET`、`DESTROY_BUDGET` 触发器
-
-#### 预算限额事件监听器
-- [ProcessesBudgetLimits.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/BudgetLimit/ProcessesBudgetLimits.php)
-  - 监听 `CreatedBudgetLimit`、`UpdatedBudgetLimit`、`DestroyedBudgetLimit` 事件
-  - 统一触发 `STORE_UPDATE_BUDGET_LIMIT` 触发器
-
-### 2.3 触发条件控制
-
-每个事件都带有 `flags` 参数，其中 `fireWebhooks` 标志位控制是否触发 Webhook：
+交易事件通过 `TransactionGroupEventFlags` 对象的 `fireWebhooks` 属性控制是否触发 Webhook，该属性默认为 `true`。
 
 ```php
-// ProcessesNewTransactionGroup.php 中的判断逻辑
+// 判断逻辑
 if ($event->flags->fireWebhooks) {
     $this->createWebhookMessages($event->objects->transactionGroups, WebhookTrigger::STORE_TRANSACTION);
 }
 ```
 
-此外，全局功能开关也会影响 Webhook 是否启用：
-- `config('firefly.feature_flags.webhooks')`
-- `FireflyConfig::get('allow_webhooks', ...)`
+**批量提交的特殊处理：**
+
+对于批量提交的交易（`batchSubmission = true`），若系统启用了批量处理配置（`enable_batch_processing`），则单个交易创建事件不会触发 Webhook，而是在批量处理完成后统一触发。
+
+### 2.3 预算类事件的触发条件
+
+预算类事件由 `ProcessesBudgets` 监听器统一处理，监听以下三个事件：
+
+- `CreatedBudget`（预算创建）→ 触发 `STORE_BUDGET`
+- `UpdatedBudget`（预算更新）→ 触发 `UPDATE_BUDGET`
+- `DestroyingBudget`（预算删除中）→ 触发 `DESTROY_BUDGET`
+
+**触发控制方式：**
+
+> **注意**：预算类监听器**不检查**事件的 `createWebhookMessages` 参数，只要事件触发就会生成 Webhook 消息。
+
+虽然 `CreatedBudget` 和 `UpdatedBudget` 事件类都定义了 `createWebhookMessages` 布尔参数，但监听器的 `handle()` 方法并未使用该参数做条件判断，而是直接调用消息生成器。`DestroyingBudget` 事件则根本没有 `createWebhookMessages` 参数。
+
+### 2.4 预算限额类事件的触发条件
+
+预算限额类事件由 `ProcessesBudgetLimits` 监听器统一处理，监听以下三个事件：
+
+- `CreatedBudgetLimit`（预算限额创建）
+- `UpdatedBudgetLimit`（预算限额更新）
+- `DestroyedBudgetLimit`（预算限额删除）
+
+三个事件统一触发 `STORE_UPDATE_BUDGET_LIMIT` 触发器。
+
+**触发控制方式：**
+
+预算限额事件通过事件对象的 `createWebhookMessages` 属性控制是否触发 Webhook：
+
+```php
+// 判断逻辑
+if ($event->createWebhookMessages) {
+    $this->createWebhookMessages($event->user, $event->budget, WebhookTrigger::STORE_UPDATE_BUDGET_LIMIT);
+}
+```
+
+### 2.5 全局开关
+
+除了各事件自身的触发标志外，还有两个全局开关控制 Webhook 功能是否启用：
+
+- `config('firefly.feature_flags.webhooks')` — 功能特性开关
+- `FireflyConfig::get('allow_webhooks', ...)` — 系统配置开关
+
+任意一个为 `false` 时，Webhook 投递都不会执行。
 
 ---
 
@@ -76,7 +101,7 @@ if ($event->flags->fireWebhooks) {
 
 ### 3.1 消息生成器（StandardMessageGenerator）
 
-[StandardMessageGenerator.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Generator/Webhook/StandardMessageGenerator.php) 是消息生成的核心组件，实现了 `MessageGeneratorInterface` 接口。
+消息生成器实现了 `MessageGeneratorInterface` 接口，是消息生成的核心组件。
 
 **工作流程：**
 
@@ -87,59 +112,56 @@ if ($event->flags->fireWebhooks) {
 
 ### 3.2 Webhook 匹配规则
 
-在 `getWebhooks()` 方法中，通过以下 SQL 逻辑匹配 Webhook：
+消息生成器通过以下逻辑匹配需要触发的 Webhook：
 
 ```sql
 WHERE active = true 
   AND (webhook_triggers.title = :trigger_name OR webhook_triggers.title = 'ANY')
 ```
 
-即：触发器精确匹配 **或** 设置了 `ANY` 触发器的 Webhook 都会被选中。
+即：触发器精确匹配 **或** 设置了 `ANY` 触发器的活跃 Webhook 都会被选中。
 
 ### 3.3 响应内容类型（WebhookResponse）
 
-响应类型定义在 [WebhookResponse.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Enums/WebhookResponse.php) 中：
+响应类型枚举定义了 Webhook 消息中包含的数据内容：
 
 | 枚举值 | 数值 | 说明 |
 |--------|------|------|
 | `TRANSACTIONS` | 200 | 返回交易详情 |
 | `ACCOUNTS` | 210 | 返回关联账户信息 |
 | `BUDGET` | 230 | 返回预算详情 |
-| `RELEVANT` | 240 | 自动返回相关数据 |
-| `NONE` | 220 | 不返回内容 |
+| `RELEVANT` | 240 | 自动返回与事件相关的数据 |
+| `NONE` | 220 | 不返回具体内容（仅通知） |
 
 #### RELEVANT 响应的自动映射
 
-当 Webhook 设置为 `RELEVANT` 响应时，系统会根据触发事件的对象类型自动选择响应内容，映射规则在 `getRelevantResponse()` 方法中：
+当 Webhook 设置为 `RELEVANT` 响应时，系统会根据触发事件的对象类型自动选择实际的响应内容：
 
 | 触发对象类型 | 实际响应类型 |
 |-------------|-------------|
-| `TransactionGroup` | `TRANSACTIONS` |
-| `Budget` / `BudgetLimit` | `BUDGET` |
+| `TransactionGroup`（交易组） | `TRANSACTIONS` |
+| `Budget` / `BudgetLimit`（预算/预算限额） | `BUDGET` |
 
-#### 触发器与响应的约束关系
+#### 触发器与响应的约束
 
-[config/webhooks.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/config/webhooks.php) 中定义了触发器与响应之间的约束规则：
+配置文件中定义了触发器与响应之间的禁止组合：
 
-**禁止的响应组合（forbidden_responses）：**
-- `ANY` 触发器不能使用 `BUDGET`、`TRANSACTIONS`、`ACCOUNTS` 响应
-- 交易类触发器不能使用 `BUDGET` 响应
-- 预算类触发器不能使用 `TRANSACTIONS`、`ACCOUNTS` 响应
-
-**关联响应（force_relevant_response）：**
-定义了哪些触发器会影响其他类型的数据，用于 `RELEVANT` 响应的上下文判断。
+- `ANY` 触发器不能与 `BUDGET`、`TRANSACTIONS`、`ACCOUNTS` 响应搭配
+- 交易类触发器（`STORE_TRANSACTION`、`UPDATE_TRANSACTION`、`DESTROY_TRANSACTION`）不能与 `BUDGET` 响应搭配
+- 预算类触发器（`STORE_BUDGET`、`UPDATE_BUDGET`、`DESTROY_BUDGET`、`STORE_UPDATE_BUDGET_LIMIT`）不能与 `TRANSACTIONS`、`ACCOUNTS` 响应搭配
 
 ### 3.4 消息工厂（WebhookMessageFactory）
 
-[WebhookMessageFactory.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Factory/WebhookMessageFactory.php) 负责创建 `WebhookMessage` 模型实例：
+`WebhookMessageFactory` 负责创建 `WebhookMessage` 模型实例并持久化到数据库：
 
 ```php
 $webhookMessage = new WebhookMessage();
 $webhookMessage->webhook()->associate($webhook);
 $webhookMessage->sent    = false;  // 初始状态：未发送
 $webhookMessage->errored = false;  // 初始状态：无错误
-$webhookMessage->uuid    = $data['uuid'];  // 唯一标识
-$webhookMessage->message = $data;  // 消息内容（JSON）
+$webhookMessage->uuid    = $data['uuid'];  // 消息唯一标识
+$webhookMessage->message = $data;  // 消息内容（JSON 存储）
+$webhookMessage->save();
 ```
 
 ### 3.5 消息体结构
@@ -148,7 +170,7 @@ $webhookMessage->message = $data;  // 消息内容（JSON）
 
 ```json
 {
-  "uuid": "唯一标识符（UUID v4）",
+  "uuid": "a1b2c3d4-...（UUID v4）",
   "user_id": 0,
   "user_group_id": 0,
   "trigger": "STORE_TRANSACTION",
@@ -172,67 +194,70 @@ Webhook 投递采用 **定时任务触发 + 队列异步发送** 的混合模式
     ↓
 生成 WebhookMessage（sent=false, errored=false）
     ↓
-WebhookCronjob（每10分钟） ──→ 触发 WebhookMessagesRequestSending 事件
+WebhookCronjob（每10分钟） ──→ 发布 WebhookMessagesRequestSending 事件
     ↓
 SendsWebhookMessages 监听器
     ↓
-筛选待发送消息（最多5条，尝试次数≤2）
+筛选待发送消息（sent=false 且 尝试次数≤2，每次最多5条）
     ↓
-SendWebhookMessage Job（异步队列）
+SendWebhookMessage Job（Laravel Queue 异步执行）
     ↓
-StandardWebhookSender 发送
+StandardWebhookSender 执行发送
     ↓
-成功：sent=true
-失败：sent=false, errored=true，记录 WebhookAttempt
+  成功 → sent=true
+  失败 → sent=false, errored=true，记录 WebhookAttempt
 ```
 
 ### 4.2 定时任务触发（WebhookCronjob）
 
-[WebhookCronjob.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Support/Cronjobs/WebhookCronjob.php) 负责周期性地触发 Webhook 发送：
+`WebhookCronjob` 负责周期性地触发 Webhook 发送流程。
 
-**执行频率：** 每 10 分钟一次（通过 `last_webhook_job` 配置记录上次执行时间，间隔 600 秒）
+**执行频率：** 每 10 分钟一次（通过 `last_webhook_job` 配置记录上次执行时间戳，间隔需大于 600 秒）
 
-**核心逻辑：**
+**核心判断逻辑：**
+
 ```php
+$lastTime = (int) FireflyConfig::get('last_webhook_job', 0)->data;
 $diff = now()->getTimestamp() - $lastTime;
 if ($diff > 600) {
-    $this->fireWebhookMessages();  // 触发发送
+    $this->fireWebhookMessages();
 }
 ```
 
-**触发方式：** 通过 `event(new WebhookMessagesRequestSending())` 发布事件
+**触发方式：** 通过发布 `WebhookMessagesRequestSending` 事件来触发后续流程。
 
-### 4.3 消息分发（SendsWebhookMessages）
+### 4.3 消息筛选规则
 
-[SendsWebhookMessages.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Listeners/Model/Webhook/SendsWebhookMessages.php) 监听器处理 `WebhookMessagesRequestSending` 事件：
+`SendsWebhookMessages` 监听器处理 `WebhookMessagesRequestSending` 事件时，按以下规则筛选待发送消息：
 
-**消息筛选规则：**
-1. `sent = false` — 未发送的消息
-2. `webhookAttempts()->count() <= 2` — 尝试次数不超过 3 次（0、1、2 共 3 次）
-3. `splice(0, 5)` — 每次最多处理 5 条消息
+**筛选条件（同时满足）：**
 
-**发送流程：**
+1. **`sent = false`** — 消息处于未发送状态（发送失败后会被重置为此状态）
+2. **`webhookAttempts()->count() <= 2`** — 历史尝试记录不超过 2 条
+
+**数量限制：**
+
+- 每次 Cronjob 执行最多处理 `5` 条消息（`splice(0, 5)`）
+
+### 4.4 分发逻辑
+
+筛选出消息后，按以下流程分发到队列：
+
 ```php
 foreach ($messages as $message) {
-    $message->sent = true;       // 先标记为已发送（防重复）
-    $message->save();
-    SendWebhookMessage::dispatch($message)->afterResponse();  // 分发到队列
+    if (false === $message->sent) {
+        $message->sent = true;       // 先标记为已发送（防止重复分发）
+        $message->save();
+        SendWebhookMessage::dispatch($message)->afterResponse();
+    }
 }
 ```
 
-> **注意**：这里先将 `sent` 设为 `true` 是为了防止重复分发。如果发送失败，会在 Sender 中将 `sent` 重新设回 `false` 并标记 `errored=true`。
+> **重要说明**：在分发前就将 `sent` 标记为 `true`，这是一种防止重复分发的乐观锁策略。如果后续实际发送失败，发送器会将 `sent` 重新设回 `false` 并标记 `errored = true`。
 
-**清理机制：**
-```php
-WebhookMessage::where('sent', true)
-    ->where('created_at', '<', now()->subDays(14))
-    ->delete();
-```
-已发送超过 14 天的消息会被自动清理。
+### 4.5 队列任务（SendWebhookMessage）
 
-### 4.4 队列任务（SendWebhookMessage）
-
-[SendWebhookMessage.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Jobs/SendWebhookMessage.php) 是 Laravel Queue Job，实现了 `ShouldQueue` 接口：
+`SendWebhookMessage` 是实现了 `ShouldQueue` 接口的 Laravel Queue Job，负责异步执行发送：
 
 ```php
 public function handle(): void
@@ -243,31 +268,49 @@ public function handle(): void
 }
 ```
 
-该 Job 本身不包含复杂逻辑，只是委托给 `WebhookSenderInterface` 完成实际发送。
+Job 本身不包含业务逻辑，只是委托给 `WebhookSenderInterface` 完成实际发送。
 
-### 4.5 重试策略
+### 4.6 重试策略
 
-**重试次数：** 最多 3 次（首次 + 2 次重试）
+**最大发送次数：3 次**（首次发送 + 2 次重试）
 
-**重试间隔：** 由 Cronjob 的执行频率决定，约每 10 分钟重试一次
+推导过程：
+- 筛选条件为 `webhookAttempts()->count() <= 2`
+- 当尝试记录数为 0 时：首次发送（第 1 次）
+- 当尝试记录数为 1 时：第 1 次重试（第 2 次发送）
+- 当尝试记录数为 2 时：第 2 次重试（第 3 次发送）
+- 当尝试记录数达到 3 时：不再被选中，消息停留在失败状态
 
-**重试条件：**
-- `sent = false` （发送失败后被重置）
-- `webhookAttempts 记录数 ≤ 2`
+**重试间隔：** 约 10 分钟（由 Cronjob 执行频率决定）
 
-**失败记录：** 每次发送失败都会创建一条 [WebhookAttempt](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Models/WebhookAttempt.php) 记录，包含：
-- `status_code`：HTTP 状态码（0 表示连接错误）
-- `logs`：错误日志和堆栈信息
+**失败记录：** 每次发送失败都会创建一条 `WebhookAttempt` 记录，包含：
+- `status_code`：HTTP 状态码（0 表示连接错误等网络异常）
+- `logs`：错误信息和堆栈跟踪
+
+### 4.7 过期清理
+
+每次执行发送时，会自动清理已发送超过 14 天的消息记录：
+
+```php
+WebhookMessage::where('sent', true)
+    ->where('created_at', '<', now()->subDays(14))
+    ->delete();
+```
 
 ---
 
-## 五、签名校验机制
+## 五、签名机制
 
-### 5.1 签名生成器（Sha3SignatureGenerator）
+### 5.1 职责边界
 
-[Sha3SignatureGenerator.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Helpers/Webhook/Sha3SignatureGenerator.php) 实现了 `SignatureGeneratorInterface` 接口，使用 HMAC-SHA3-256 算法生成签名。
+- **发送端**：Firefly III 负责生成签名并放入请求头
+- **接收端**：外部系统负责验证签名的有效性
 
-### 5.2 签名生成过程
+本文档仅说明发送端的签名生成逻辑，并给出接收端验证的参考方法。
+
+### 5.2 发送端签名生成
+
+发送端使用 `Sha3SignatureGenerator` 生成签名，算法为 **HMAC-SHA3-256**。
 
 **签名 payload 构造：**
 
@@ -275,15 +318,12 @@ public function handle(): void
 payload = timestamp + "." + json_body
 ```
 
-其中：
-- `timestamp`：Unix 时间戳（秒级）
-- `json_body`：消息内容的 JSON 字符串
+- `timestamp`：当前 Unix 时间戳（秒级，字符串形式）
+- `json_body`：完整的请求体 JSON 字符串
 
 **签名计算：**
 
-```php
-$signature = hash_hmac('sha3-256', $payload, $webhook->secret);
-```
+使用 Webhook 配置的 `secret` 作为密钥，对 payload 进行 HMAC-SHA3-256 运算。
 
 **签名头格式：**
 
@@ -293,54 +333,52 @@ Signature: t=1717986918,v1=abc123def456...
 
 格式说明：
 - `t=` 前缀：时间戳
-- `v1=` 前缀：v1 版本的签名值
-- 多组签名之间用逗号分隔
+- `v1=` 前缀：v1 版本的签名值（当前仅 v1 版本）
+- 多部分之间用逗号分隔
 
-### 5.3 请求头信息
+### 5.3 接收端验证参考
 
-[StandardWebhookSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Services/Webhook/StandardWebhookSender.php) 中定义的请求头：
+接收端验证签名的一般步骤：
 
-| Header | 值 | 说明 |
-|--------|----|------|
+1. 从 `Signature` 请求头中解析出时间戳 `t` 和签名值 `v1`
+2. 将时间戳与原始请求体拼接：`payload = t + "." + raw_body`
+3. 使用约定的 secret，以 HMAC-SHA3-256 算法计算签名
+4. 使用恒定时间比较算法，比对计算出的签名与 `v1` 值
+5. 可选：校验时间戳的时效性（如 5 分钟内有效），防止重放攻击
+
+### 5.4 其他请求头
+
+发送请求时还会携带以下头信息：
+
+| Header | 值/格式 | 说明 |
+|--------|---------|------|
 | `Content-Type` | `application/json` | 请求体类型 |
 | `Accept` | `application/json` | 期望的响应类型 |
-| `Signature` | `t=...,v1=...` | 签名 |
 | `User-Agent` | `FireflyIII/{version}` | 客户端标识 |
 | `connect_timeout` | `3.14` | 连接超时（秒） |
 | `timeout` | `10` | 请求总超时（秒） |
 
-### 5.4 验签方法（接收方）
-
-接收方验证签名的步骤：
-
-1. 从 `Signature` 头中解析出 `t`（时间戳）和 `v1`（签名值）
-2. 将时间戳与请求体拼接：`payload = t + "." + body`
-3. 使用相同的 secret 和 HMAC-SHA3-256 计算签名
-4. 比较计算出的签名与 `v1` 值是否一致
-5. 可选：校验时间戳防止重放攻击（如 5 分钟内有效）
-
 ---
 
-## 六、发送执行流程（StandardWebhookSender）
+## 六、发送执行流程
 
-### 6.1 发送流程详解
+### 6.1 完整流程
 
-[StandardWebhookSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Services/Webhook/StandardWebhookSender.php) 的 `send()` 方法是实际执行发送的核心。
-
-**完整流程：**
+`StandardWebhookSender` 的 `send()` 方法是实际执行发送的核心，完整流程如下：
 
 ```
-1. 标记消息为 sent=true（预标记）
-2. 验证 Webhook URL 合法性（IsValidWebhookUrl 规则）
-3. 生成签名（可能失败：FireflyException）
-   ├─ 失败：记录 WebhookAttempt，sent=false, errored=true，返回
-4. 序列化消息体为 JSON（可能失败：JsonException）
-   ├─ 失败：记录 WebhookAttempt，sent=false, errored=true，返回
-5. 发送 HTTP POST 请求（GuzzleHttp Client）
-   ├─ 成功：sent=true，记录日志
-   └─ 失败（ConnectException/RequestException）：
-        ├─ 记录 WebhookAttempt（status_code + logs）
-        ├─ sent=false, errored=true
+1. 设置 sent = true（与分发时的乐观锁呼应，再次确认）
+2. 验证 Webhook URL 的合法性（IsValidWebhookUrl 规则）
+3. 调用签名生成器生成签名
+   └─ 失败：记录 WebhookAttempt，sent=false，errored=true，直接返回
+4. 将消息内容序列化为 JSON
+   └─ 失败：记录 WebhookAttempt，sent=false，errored=true，直接返回
+5. 使用 GuzzleHttp 发送 POST 请求
+   ├─ 成功：sent = true，记录响应日志
+   └─ 失败（ConnectException / RequestException）：
+        ├─ 提取状态码和响应体
+        ├─ 记录 WebhookAttempt
+        ├─ sent = false，errored = true
         └─ 返回
 ```
 
@@ -350,71 +388,67 @@ Signature: t=1717986918,v1=abc123def456...
 
 | 异常类型 | 触发场景 | 处理方式 |
 |---------|---------|---------|
-| `FireflyException` | 签名生成失败（如 Webhook 被删除） | 记录尝试，标记错误，返回 |
+| `FireflyException` | 签名生成失败（如 Webhook 已被删除） | 记录尝试，标记错误，返回 |
 | `JsonException` | 消息内容 JSON 序列化失败 | 记录尝试，标记错误，返回 |
 | `ConnectException` / `RequestException` | 网络连接错误或 HTTP 错误响应 | 记录状态码和响应体，标记错误 |
 
-### 6.3 URL 安全校验
-
-使用 `IsValidWebhookUrl` 规则对 Webhook URL 进行验证，防止 SSRF 等安全问题。
-
 ---
 
-## 七、数据模型与表结构
+## 七、数据模型
 
 ### 7.1 核心模型关系
 
 ```
 Webhook (1) ────→ (N) WebhookMessage (1) ────→ (N) WebhookAttempt
     │
-    ├── (N) WebhookTrigger（多对多）
-    ├── (N) WebhookResponse（多对多）
-    └── (N) WebhookDelivery（多对多）
+    ├── (N) WebhookTrigger（多对多关联表：webhook_webhook_trigger）
+    ├── (N) WebhookResponse（多对多关联表：webhook_webhook_response）
+    └── (N) WebhookDelivery（多对多关联表：webhook_webhook_delivery）
 ```
 
 ### 7.2 Webhook 模型
 
-[Webhook.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Models/Webhook.php) 主要字段：
+Webhook 模型代表一个 Webhook 配置，主要字段：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `active` | boolean | 是否启用 |
 | `trigger` | integer | 触发器类型（枚举值） |
 | `response` | integer | 响应类型（枚举值） |
-| `delivery` | integer | 投递方式（JSON=300） |
-| `url` | string | Webhook 地址 |
+| `delivery` | integer | 投递方式（JSON = 300） |
+| `url` | string | Webhook 接收地址 |
 | `secret` | string | 签名密钥 |
-| `title` | string | 标题 |
+| `title` | string | 配置标题 |
 | `user_id` | integer | 所属用户 |
 
 ### 7.3 WebhookMessage 模型
 
-[WebhookMessage.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Models/WebhookMessage.php) 主要字段：
+WebhookMessage 模型代表一条待发送或已发送的消息，主要字段：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `webhook_id` | integer | 关联的 Webhook |
-| `sent` | boolean 是否已发送 |
-| `errored` | boolean | 是否出错 |
+| `webhook_id` | integer | 关联的 Webhook 配置 |
+| `sent` | boolean | 是否已发送 |
+| `errored` | boolean | 是否发送出错 |
 | `uuid` | string | 消息唯一标识 |
 | `message` | json | 消息内容 |
 | `logs` | json | 日志信息 |
 
 ### 7.4 WebhookAttempt 模型
 
-[WebhookAttempt.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Models/WebhookAttempt.php) 主要字段：
+WebhookAttempt 模型记录每次发送尝试的结果，主要字段：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `webhook_message_id` | integer | 关联的消息 |
-| `status_code` | integer | HTTP 状态码 |
-| `logs` | text | 日志/错误信息 |
+| `status_code` | integer | HTTP 响应状态码（0 表示网络异常） |
+| `logs` | text | 日志或错误详情 |
 
 ---
 
 ## 八、服务容器绑定
 
-所有 Webhook 相关服务在 [FireflyServiceProvider.php](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Providers/FireflyServiceProvider.php) 中注册：
+所有 Webhook 相关服务通过接口绑定到服务容器，便于扩展和测试：
 
 ```php
 $this->app->bind(MessageGeneratorInterface::class, StandardMessageGenerator::class);
@@ -422,85 +456,29 @@ $this->app->bind(SignatureGeneratorInterface::class, Sha3SignatureGenerator::cla
 $this->app->bind(WebhookSenderInterface::class, StandardWebhookSender::class);
 ```
 
-这种基于接口的设计使得各组件可以独立替换，便于扩展和测试。
-
 ---
 
-## 九、关键设计决策分析
+## 九、设计决策分析
 
-### 9.1 为什么用 Cronjob 而不是直接队列？
+### 9.1 为什么用 Cronjob 触发而不是直接入队？
 
 - **削峰填谷**：大量交易同时创建时，避免瞬间产生大量队列任务
-- **重试友好**：天然支持定时重试，无需额外的重试队列配置
-- **可控性强**：每次只处理 5 条，对外部系统压力小
+- **重试天然支持**：利用定时任务的周期性，无需额外配置重试队列
+- **流量可控**：每次只处理 5 条，对外部接收系统的压力小且可预测
 
 ### 9.2 为什么先标记 sent=true 再发送？
 
 这是一种 **乐观锁** 策略：
-- 防止 Cronjob 重复分发同一条消息
-- 如果发送失败，再将 `sent` 设回 `false`
-- 代价：极端情况下（进程崩溃）可能出现消息标记为已发送但实际未发送的情况
+- 防止 Cronjob 重复分发同一条消息（在消息入队前就标记）
+- 如果发送失败，发送器负责将 sent 重新设回 false
+- 潜在风险：极端情况下（进程在标记后、分发前崩溃）可能出现消息"失踪"——标记为已发送但实际未入队
 
-### 9.3 为什么用 HMAC-SHA3-256 而不是 SHA256？
+### 9.3 为什么重试次数是 3 次？
 
-SHA-3（Keccak）是最新的哈希算法标准，相比 SHA-2 有更好的安全性和抗量子计算攻击能力。
-
-### 9.4 为什么重试次数限制为 3 次？
-
-- 平衡投递可靠性与资源消耗
+- 平衡投递可靠性与系统资源消耗
 - 配合约 10 分钟的重试间隔，总重试窗口约 20 分钟
-- 持续失败的 Webhook 可能意味着接收端已不可用，继续重试意义不大
+- 持续失败的 Webhook 往往意味着接收端故障或配置错误，继续重试收益有限
 
----
+### 9.4 为什么用 HMAC-SHA3-256？
 
-## 十、完整时序图
-
-```
-用户操作
-   │
-   ▼
-业务模型变更（TransactionGroup/Budget 等）
-   │
-   ▼
-触发模型事件（CreatedSingleTransactionGroup 等）
-   │
-   ▼
-事件监听器（ProcessesNewTransactionGroup 等）
-   │  fireWebhooks = true?
-   ▼
-StandardMessageGenerator
-   │  1. 筛选匹配的 Webhook
-   │  2. 生成消息内容
-   │  3. WebhookMessageFactory 创建记录
-   ▼
-webhook_messages 表（sent=false, errored=false）
-   │
-   ▼
-WebhookCronjob（每10分钟）
-   │
-   ▼
-WebhookMessagesRequestSending 事件
-   │
-   ▼
-SendsWebhookMessages 监听器
-   │  筛选：sent=false 且 尝试次数≤2
-   │  每次最多 5 条
-   ▼
-SendWebhookMessage Job（Laravel Queue）
-   │
-   ▼
-StandardWebhookSender
-   │  1. 验证 URL
-   │  2. Sha3SignatureGenerator 生成签名
-   │  3. GuzzleHttp 发送 POST 请求
-   ▼
-成功？───────┬────── 是 ──────► sent=true
-   │        │
-   否       │
-   │        │
-   ▼        │
-记录 WebhookAttempt
-sent=false, errored=true
-   │
-   └── 下次 Cronjob 重试（最多 3 次）
-```
+SHA-3（Keccak）是最新的 SHA 标准，相比 SHA-2 在密码学安全性上更强，且对量子计算攻击有更好的抗性。HMAC 结构确保了签名的可验证性和不可伪造性。
