@@ -2,10 +2,11 @@
 
 ## 一、概述
 
-Firefly III 的 Webhook 系统采用 **事件驱动 + 异步队列 + 定时重试** 的三层架构，确保业务事件能够可靠地投递到外部系统。整个系统由以下核心组件协作完成：
+Firefly III 的 Webhook 系统采用 **事件驱动 + 多层触发 + 异步队列 + 定时重试** 的架构，确保业务事件能够可靠地投递到外部系统。整个系统由以下核心组件协作完成：
 
 - **事件触发层**：监听模型变更事件，生成 Webhook 消息
 - **消息生成层**：根据触发器类型和响应格式生成消息内容
+- **调度入口层**：四种触发方式共同保障消息投递的实时性与可靠性
 - **投递队列层**：通过 Laravel Queue 异步发送，结合 Cronjob 实现重试
 - **签名安全层**：使用 HMAC-SHA3-256 对请求进行签名
 
@@ -94,6 +95,31 @@ if ($event->createWebhookMessages) {
 - `FireflyConfig::get('allow_webhooks', ...)` — 系统配置开关
 
 任意一个为 `false` 时，Webhook 投递都不会执行。
+
+### 2.6 消息生成与投递触发的两步流程
+
+理解 Webhook 投递的关键是区分两个独立的步骤：
+
+1. **消息生成**：由模型事件监听器（如 `ProcessesBudgets`、`ProcessesBudgetLimits`）响应业务事件，调用消息生成器创建 `WebhookMessage` 记录
+2. **投递触发**：发布 `WebhookMessagesRequestSending` 事件，由 `SendsWebhookMessages` 监听器将待发送消息分发到队列
+
+这两步是**解耦**的——生成消息的路径不一定会立即触发投递，反之亦然。
+
+**各业务路径的两步流程对比：**
+
+| 业务操作 | 消息生成 | 立即投递触发 | 代码位置 |
+|---------|---------|-------------|---------|
+| 交易创建 | ✅ `fireWebhooks=true` 时生成 | ✅ 立即发布 | [TransactionGroupRepository::store()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L337-L372) |
+| 交易更新 | ✅ `fireWebhooks=true` 时生成 | ✅ 立即发布 | UpdateController 等 |
+| 交易删除 | ✅ `fireWebhooks=true` 时生成 | ✅ 立即发布 | [TransactionGroupDestroyService](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Services/Internal/Destroy/TransactionGroupDestroyService.php#L36-L54) |
+| 预算创建 | ✅ 始终生成（监听器不检查参数） | ✅ 立即发布 | [BudgetRepository::store()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/Budget/BudgetRepository.php#L544-L640) |
+| 预算更新 | ✅ 始终生成（监听器不检查参数） | ✅ 立即发布 | [BudgetRepository::update()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/Budget/BudgetRepository.php#L642-L692) |
+| **预算删除** | ✅ 始终生成（DestroyingBudget 事件） | ❌ **不发布！** | [BudgetDestroyService](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Services/Internal/Destroy/BudgetDestroyService.php#L36-L85) |
+| 预算限额创建 | ✅ `createWebhookMessages=true` 时生成 | ✅ 立即发布 | [BudgetLimitRepository::store()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/Budget/BudgetLimitRepository.php#L328-L356) |
+| 预算限额更新 | ✅ `createWebhookMessages=true` 时生成 | ✅ 立即发布 | [BudgetLimitRepository::update()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/Budget/BudgetLimitRepository.php#L360-L410) |
+| 预算限额删除 | ✅ `createWebhookMessages=true` 时生成 | ✅ 立即发布 | [BudgetLimitRepository::destroyBudgetLimit()](file:///d:/fz/0508-2/solo-dogfeeding/code/126-firefly-iii/app/Repositories/Budget/BudgetLimitRepository.php#L121-L133) |
+
+> **重要发现**：预算删除（`BudgetDestroyService`）是唯一的例外——它只生成 Webhook 消息，但**不立即发布投递请求**。删除预算产生的 Webhook 消息需要依赖页面随机兜底、手动触发或定时任务来实际发送。
 
 ---
 
@@ -344,30 +370,37 @@ event(new WebhookMessagesRequestSending());
 
 ## 五、投递队列与重试机制
 
-### 4.1 整体架构
+### 5.1 整体架构
 
-Webhook 投递采用 **定时任务触发 + 队列异步发送** 的混合模式：
+Webhook 投递采用 **多层触发 + 队列异步发送** 的混合模式。`WebhookMessagesRequestSending` 事件是投递流程的统一入口，由四种方式触发后进入统一的队列发送流程：
 
 ```
-业务事件发生
-    ↓
-生成 WebhookMessage（sent=false, errored=false）
-    ↓
-WebhookCronjob（每10分钟） ──→ 发布 WebhookMessagesRequestSending 事件
-    ↓
-SendsWebhookMessages 监听器
-    ↓
-筛选待发送消息（sent=false 且 尝试次数≤2，每次最多5条）
-    ↓
-SendWebhookMessage Job（Laravel Queue 异步执行）
-    ↓
-StandardWebhookSender 执行发送
-    ↓
-  成功 → sent=true
-  失败 → sent=false, errored=true，记录 WebhookAttempt
+                              ┌─────────────────────────────┐
+                              │   调度入口（四种触发方式）   │
+                              ├─────────────────────────────┤
+                              │  1. 业务保存后立即发布       │
+                              │  2. 页面随机兜底（1/30概率） │
+                              │  3. 手动触发 API 接口       │
+                              │  4. 定时任务（每10分钟）    │
+                              └───────────────┬─────────────┘
+                                              ↓
+                          WebhookMessagesRequestSending 事件
+                                              ↓
+                              SendsWebhookMessages 监听器
+                                              ↓
+                        筛选待发送消息（sent=false 且 尝试次数≤2，每次最多5条）
+                                              ↓
+                        SendWebhookMessage Job（Laravel Queue 异步执行）
+                                              ↓
+                            StandardWebhookSender 执行发送
+                                              ↓
+                        ┌─────────────────────┴─────────────────────┐
+                        ↓                                           ↓
+                  成功 → sent=true                          失败 → sent=false, errored=true
+                                                                   记录 WebhookAttempt
 ```
 
-### 4.2 定时任务触发（WebhookCronjob）
+### 5.2 定时任务触发（WebhookCronjob）
 
 `WebhookCronjob` 负责周期性地触发 Webhook 发送流程。
 
@@ -385,7 +418,7 @@ if ($diff > 600) {
 
 **触发方式：** 通过发布 `WebhookMessagesRequestSending` 事件来触发后续流程。
 
-### 4.3 消息筛选规则
+### 5.3 消息筛选规则
 
 `SendsWebhookMessages` 监听器处理 `WebhookMessagesRequestSending` 事件时，按以下规则筛选待发送消息：
 
@@ -398,7 +431,7 @@ if ($diff > 600) {
 
 - 每次 Cronjob 执行最多处理 `5` 条消息（`splice(0, 5)`）
 
-### 4.4 分发逻辑
+### 5.4 分发逻辑
 
 筛选出消息后，按以下流程分发到队列：
 
@@ -414,7 +447,7 @@ foreach ($messages as $message) {
 
 > **重要说明**：在分发前就将 `sent` 标记为 `true`，这是一种防止重复分发的乐观锁策略。如果后续实际发送失败，发送器会将 `sent` 重新设回 `false` 并标记 `errored = true`。
 
-### 4.5 队列任务（SendWebhookMessage）
+### 5.5 队列任务（SendWebhookMessage）
 
 `SendWebhookMessage` 是实现了 `ShouldQueue` 接口的 Laravel Queue Job，负责异步执行发送：
 
@@ -429,7 +462,7 @@ public function handle(): void
 
 Job 本身不包含业务逻辑，只是委托给 `WebhookSenderInterface` 完成实际发送。
 
-### 4.6 重试策略
+### 5.6 重试策略
 
 **最大发送次数：3 次**（首次发送 + 2 次重试）
 
@@ -446,7 +479,7 @@ Job 本身不包含业务逻辑，只是委托给 `WebhookSenderInterface` 完�
 - `status_code`：HTTP 状态码（0 表示连接错误等网络异常）
 - `logs`：错误信息和堆栈跟踪
 
-### 4.7 过期清理
+### 5.7 过期清理
 
 每次执行发送时，会自动清理已发送超过 14 天的消息记录：
 
@@ -495,7 +528,7 @@ Signature: t=1717986918,v1=abc123def456...
 - `v1=` 前缀：v1 版本的签名值（当前仅 v1 版本）
 - 多部分之间用逗号分隔
 
-### 5.3 接收端验证参考
+### 6.3 接收端验证参考
 
 接收端验证签名的一般步骤：
 
@@ -505,7 +538,7 @@ Signature: t=1717986918,v1=abc123def456...
 4. 使用恒定时间比较算法，比对计算出的签名与 `v1` 值
 5. 可选：校验时间戳的时效性（如 5 分钟内有效），防止重放攻击
 
-### 5.4 其他请求头
+### 6.4 其他请求头
 
 发送请求时还会携带以下头信息：
 
@@ -519,9 +552,9 @@ Signature: t=1717986918,v1=abc123def456...
 
 ---
 
-## 六、发送执行流程
+## 七、发送执行流程
 
-### 6.1 完整流程
+### 7.1 完整流程
 
 `StandardWebhookSender` 的 `send()` 方法是实际执行发送的核心，完整流程如下：
 
@@ -541,7 +574,7 @@ Signature: t=1717986918,v1=abc123def456...
         └─ 返回
 ```
 
-### 6.2 异常处理
+### 7.2 异常处理
 
 发送过程中可能遇到三类异常：
 
@@ -553,9 +586,9 @@ Signature: t=1717986918,v1=abc123def456...
 
 ---
 
-## 七、数据模型
+## 八、数据模型
 
-### 7.1 核心模型关系
+### 8.1 核心模型关系
 
 ```
 Webhook (1) ────→ (N) WebhookMessage (1) ────→ (N) WebhookAttempt
@@ -565,7 +598,7 @@ Webhook (1) ────→ (N) WebhookMessage (1) ────→ (N) WebhookAt
     └── (N) WebhookDelivery（多对多关联表：webhook_webhook_delivery）
 ```
 
-### 7.2 Webhook 模型
+### 8.2 Webhook 模型
 
 Webhook 模型代表一个 Webhook 配置，主要字段：
 
@@ -580,7 +613,7 @@ Webhook 模型代表一个 Webhook 配置，主要字段：
 | `title` | string | 配置标题 |
 | `user_id` | integer | 所属用户 |
 
-### 7.3 WebhookMessage 模型
+### 8.3 WebhookMessage 模型
 
 WebhookMessage 模型代表一条待发送或已发送的消息，主要字段：
 
@@ -593,7 +626,7 @@ WebhookMessage 模型代表一条待发送或已发送的消息，主要字段�
 | `message` | json | 消息内容 |
 | `logs` | json | 日志信息 |
 
-### 7.4 WebhookAttempt 模型
+### 8.4 WebhookAttempt 模型
 
 WebhookAttempt 模型记录每次发送尝试的结果，主要字段：
 
@@ -605,7 +638,7 @@ WebhookAttempt 模型记录每次发送尝试的结果，主要字段：
 
 ---
 
-## 八、服务容器绑定
+## 九、服务容器绑定
 
 所有 Webhook 相关服务通过接口绑定到服务容器，便于扩展和测试：
 
@@ -617,27 +650,38 @@ $this->app->bind(WebhookSenderInterface::class, StandardWebhookSender::class);
 
 ---
 
-## 九、设计决策分析
+## 十、设计决策分析
 
-### 9.1 为什么用 Cronjob 触发而不是直接入队？
+### 10.1 为什么用多层触发而不是单一触发方式？
+
+四种触发方式互为补充，形成了"实时 + 兜底"的多层保障机制：
+
+- **业务保存后立即发布**：保证实时性，让绝大多数消息能在事件发生后立即投递
+- **页面随机兜底**：轻量级补充，利用用户访问流量偶尔触发，不依赖定时任务基础设施
+- **手动触发接口**：满足测试和手动重发的需求
+- **定时任务**：最可靠的兜底，确保所有消息最终都能被处理
+
+### 10.2 为什么用 Cronjob + 队列的混合投递模式？
+
+在投递执行层面，采用 Cronjob 触发 + 队列异步发送的混合模式，原因有三：
 
 - **削峰填谷**：大量交易同时创建时，避免瞬间产生大量队列任务
 - **重试天然支持**：利用定时任务的周期性，无需额外配置重试队列
 - **流量可控**：每次只处理 5 条，对外部接收系统的压力小且可预测
 
-### 9.2 为什么先标记 sent=true 再发送？
+### 10.3 为什么先标记 sent=true 再发送？
 
 这是一种 **乐观锁** 策略：
-- 防止 Cronjob 重复分发同一条消息（在消息入队前就标记）
+- 防止多次触发重复分发同一条消息（在消息入队前就标记）
 - 如果发送失败，发送器负责将 sent 重新设回 false
 - 潜在风险：极端情况下（进程在标记后、分发前崩溃）可能出现消息"失踪"——标记为已发送但实际未入队
 
-### 9.3 为什么重试次数是 3 次？
+### 10.4 为什么重试次数是 3 次？
 
 - 平衡投递可靠性与系统资源消耗
 - 配合约 10 分钟的重试间隔，总重试窗口约 20 分钟
 - 持续失败的 Webhook 往往意味着接收端故障或配置错误，继续重试收益有限
 
-### 9.4 为什么用 HMAC-SHA3-256？
+### 10.5 为什么用 HMAC-SHA3-256？
 
 SHA-3（Keccak）是最新的 SHA 标准，相比 SHA-2 在密码学安全性上更强，且对量子计算攻击有更好的抗性。HMAC 结构确保了签名的可验证性和不可伪造性。
