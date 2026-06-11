@@ -1,139 +1,231 @@
-# Firefly III 安全事件：触发、记录持久化与通知分发协作机制
+# Firefly III 安全事件：触发、发现、持久化与通知分发协作机制
 
-本文档梳理 Firefly III 中安全相关事件从触发到记录再到通知用户的完整协作流程。
-
----
-
-## 一、整体架构概览
-
-```
-┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────────────┐
-│   触发源 (Controller│────▶│   Event 事件类    │────▶│   Listener 监听器们     │
-│   Service, Action)  │     │  (数据载体)       │     │  (异步队列 ShouldQueue)  │
-└─────────────────────┘     └──────────────────┘     └─────────┬───────────────┘
-                                                               │
-                    ┌──────────────────────────────────────────┼──────────────────┐
-                    │                                          │                  │
-                    ▼                                          ▼                  ▼
-        ┌─────────────────────┐                   ┌────────────────────┐  ┌──────────────┐
-        │  1. 审计日志文件     │                   │  2. 数据库持久化     │  │ 3. 通知分发   │
-        │  (audit channel)    │                   │  (audit_log_entries)│  │ (邮件/Slack等)│
-        └─────────────────────┘                   └────────────────────┘  └──────────────┘
-```
-
-核心协作链路：**触发源 → Event → Listener → (日志 + 数据库 + 通知)**
+本文档详细梳理 Firefly III 中安全相关事件从**触发** → **事件-监听器绑定发现** → **记录持久化** → **通知分发**的完整协作链路，并补充三处关键机制的可复核说明。
 
 ---
 
-## 二、事件触发机制（Event Dispatching）
+## 一、整体架构全景
 
-### 2.1 事件分类
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           触发源 (Triggers)                                   │
+│  ┌────────────────┐  ┌───────────────┐  ┌──────────────────┐  ┌────────────┐ │
+│  │ LoginController│  │ MfaController │  │ OAuthController  │  │ Passport   │ │
+│  │ (登录/登出)    │  │ (MFA管理)     │  │ (Token管理)      │  │ (内部事件) │ │
+│  └───────┬────────┘  └──────┬────────┘  └────────┬─────────┘  └──────┬─────┘ │
+│          │ event()          │ event()            │ event()             │       │
+└──────────┼──────────────────┼────────────────────┼─────────────────────┼───────┘
+           │                  │                    │                     │
+           ▼                  ▼                    ▼                     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      Event 事件类 (数据载体 DTO)                              │
+│  ┌───────────────────────┐ ┌────────────────────────┐ ┌─────────────────────┐│
+│  │FireflyIII\Events\...  │ │Illuminate\Auth\Events\ │ │Laravel\Passport\    ││
+│  │(自定义安全事件 17种)   │ │Login (框架内置登录)    │ │Events\AccessTokenCr.││
+│  └───────────┬───────────┘ └────────────┬───────────┘ └──────────┬──────────┘│
+└──────────────┼───────────────────────────┼─────────────────────────┼───────────┘
+               │                           │                         │
+               ▼                           ▼                         ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│          事件-监听器自动发现与绑定 (核心机制，详见第二章)                      │
+│                                                                              │
+│   入口：EventServiceProvider 继承基类 → discoverEvents()                      │
+│         扫描 app/Listeners 目录 → 解析 handle() 参数类型 → 建立 Event→Listener映射 │
+│                                                                              │
+└───────────────────────────────┬──────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      Listener 监听器 (异步队列 ShouldQueue)                   │
+│  ┌───────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐ │
+│  │ 1. 写入审计日志文件    │  │ 2. 写入数据库表      │  │ 3. 触发用户通知      │ │
+│  │ Log::channel('audit') │  │ ALERepository::store│  │ NotificationSender  │ │
+│  └───────────┬───────────┘  └──────────┬──────────┘  └──────────┬──────────┘ │
+└──────────────┼───────────────────────────┼────────────────────────┼────────────┘
+               │                           │                        │
+               ▼                           ▼                        ▼
+     ┌──────────────────┐       ┌─────────────────────┐   ┌───────────────────┐
+     │ storage/logs/    │       │ audit_log_entries   │   │ Notification 管道 │
+     │ ff3-audit.log    │       │ 表 (多态关联)        │   │ Mail/Slack/       │
+     │ (90天保留)       │       │                     │   │ Pushover/...      │
+     └──────────────────┘       └─────────────────────┘   └───────────────────┘
+```
 
-所有安全事件类位于 [app/Events/Security/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security) 目录，分为两大类：
+---
 
-#### 用户级安全事件（User 子目录）
+## 二、事件-监听器自动发现与绑定机制（可复核）
 
-| 事件类 | 触发场景 |
-|--------|----------|
-| [UserSuccessfullyLoggedIn](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserSuccessfullyLoggedIn.php) | 用户登录成功 |
-| [UserFailedLoginAttempt](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserFailedLoginAttempt.php) | 已知用户登录失败 |
-| [UserLoggedInFromNewIpAddress](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserLoggedInFromNewIpAddress.php) | 用户从新IP登录 |
-| [UserHasEnabledMFA](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasEnabledMFA.php) | 用户启用双因素认证 |
-| [UserHasDisabledMFA](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasDisabledMFA.php) | 用户禁用双因素认证 |
-| [UserHasUsedBackupCode](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasUsedBackupCode.php) | 用户使用了MFA备用码 |
-| [UserHasGeneratedNewBackupCodes](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasGeneratedNewBackupCodes.php) | 用户生成了新的备用码 |
-| [UserHasFewMFABackupCodesLeft](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasFewMFABackupCodesLeft.php) | 备用码数量不足 |
-| [UserHasNoMFABackupCodesLeft](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserHasNoMFABackupCodesLeft.php) | 备用码用完 |
-| [UserKeepsFailingMFA](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserKeepsFailingMFA.php) | MFA多次验证失败 |
-| [UserChangedEmailAddress](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserChangedEmailAddress.php) | 用户修改邮箱 |
-| [UserRequestedNewPassword](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User/UserRequestedNewPassword.php) | 用户请求重置密码 |
+### 2.1 绑定入口：EventServiceProvider 继承链
 
-#### 系统级安全事件（System 子目录）
+Firefly III 并未在 [EventServiceProvider.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Providers/EventServiceProvider.php) 的 `$listen` 数组中显式配置事件映射（第36-50行全部被注释）。真正的绑定逻辑由**父类**提供：
 
-| 事件类 | 触发场景 |
-|--------|----------|
-| [UnknownUserTriedLogin](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System/UnknownUserTriedLogin.php) | 不存在的用户尝试登录 |
-| [NewUserRegistered](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System/NewUserRegistered.php) | 新用户注册 |
-| [NewInvitationCreated](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System/NewInvitationCreated.php) | 创建了新邀请 |
-| [SystemRequestedVersionCheck](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System/SystemRequestedVersionCheck.php) | 系统发起版本检查 |
-| [SystemFoundNewVersionOnline](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System/SystemFoundNewVersionOnline.php) | 检测到新版本 |
+```
+FireflyIII\Providers\EventServiceProvider
+        │
+        │  extends
+        ▼
+Illuminate\Foundation\Support\Providers\EventServiceProvider
+        │
+        │  boot() → $this->bootDiscoverEvents()
+        │         → discoverEvents()
+        ▼
+   自动发现机制
+```
 
-### 2.2 触发方式：全局 `event()` 助手函数
+基类 `EventServiceProvider` 在 `boot()` 生命周期中调用 `discoverEvents()`，这是**所有监听器注册的真正入口**。
 
-Firefly III 使用 Laravel 的全局 `event()` 助手函数来触发事件。
+### 2.2 发现规则：目录扫描 + 参数类型推断
 
-**示例：登录成功/失败流程** — 见 [LoginController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php#L86-L147)
+Laravel 框架的自动发现遵循以下可验证规则：
+
+1. **扫描目录**：`app_path('Listeners')` — 即 Firefly III 的 [app/Listeners/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners)
+
+2. **类过滤**：该目录下所有非抽象类均被视为候选监听器
+
+3. **绑定依据**：解析每个监听器 `handle()` 方法的**参数类型声明**，该参数的类名就是监听的事件
+
+**绑定依据示例** — 以 [NotifiesUserAboutNewAccessToken.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php#L32-L43) 为例：
 
 ```php
-// 第121行：登录成功
-event(new UserSuccessfullyLoggedIn($this->guard()->user()));
-
-// 第130行：未知用户登录失败
-event(new UnknownUserTriedLogin($username));
-
-// 第133行：已知用户登录失败
-event(new UserFailedLoginAttempt($user));
-```
-
-**示例：MFA启用流程** — 见 [MfaController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Profile/MfaController.php#L223-L274)
-
-```php
-// 第271行：启用MFA
-event(new UserHasEnabledMFA($user));
-
-// 第180行：禁用MFA
-event(new UserHasDisabledMFA($user));
-
-// 第125行：生成新备用码
-event(new UserHasGeneratedNewBackupCodes($user));
-```
-
-### 2.3 事件链：事件触发事件
-
-`StoresNewIpAddress` 监听器在处理登录成功事件时，如果检测到新IP，会**再触发一个新事件**：
-
-见 [StoresNewIpAddress.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/StoresNewIpAddress.php#L36-L80)
-
-```
-UserSuccessfullyLoggedIn 事件
-       │
-       ▼
-StoresNewIpAddress 监听器
-  ├── 检查 login_ip_history 偏好设置
-  └── 如果是新IP ──▶ 触发 UserLoggedInFromNewIpAddress 事件
-                         │
-                         ▼
-                  NotifiesUserAboutNewIpAddress 监听器
-```
-
-### 2.4 事件-监听器绑定机制
-
-值得注意的是，[EventServiceProvider.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Providers/EventServiceProvider.php) 中的 `$listen` 数组大部分被注释掉了。Firefly III 使用 **Laravel 的事件自动发现（Event Discovery）** 机制：通过监听器类名上的 `#[Subscribe]` 属性（或传统方式），由 Laravel 容器自动扫描并绑定事件与监听器。
-
-监听器通过 `handle()` 方法的**类型声明**来标识监听哪个事件：
-
-```php
-class NotifiesUserAboutFailedLogin implements ShouldQueue
+class NotifiesUserAboutNewAccessToken
 {
-    // 参数类型声明 = 监听的事件
-    public function handle(UserFailedLoginAttempt $event): void
+    //  ↓↓↓ 这里的参数类型就是"绑定依据" ↓↓↓
+    public function handle(AccessTokenCreated $event): void
+    //                      ↑↑↑ Laravel 解析到这里 → 建立映射：
+    //                          AccessTokenCreated → NotifiesUserAboutNewAccessToken
     {
-        NotificationSender::send($event->user, new NotificationFailedLoginAttempt($event->user));
+        $repository = app(UserRepositoryInterface::class);
+        $user       = $repository->find((int) $event->userId);
+        if (null !== $user) {
+            NotificationSender::send($user, new NewAccessToken());
+        }
     }
 }
 ```
 
+Laravel 通过反射读取 `handle()` 的参数类型 `Laravel\Passport\Events\AccessTokenCreated`，自动建立事件类到监听器类的映射关系。
+
+### 2.3 三类事件来源的绑定实例对照
+
+下表逐一列出三类事件及其监听器的绑定（均可通过阅读 `handle()` 参数类型复核）：
+
+| 事件来源 | 事件类 | 监听器类 (handle 参数) | 所在文件 |
+|---------|--------|----------------------|---------|
+| **Firefly 自定义** | `UserFailedLoginAttempt` | `NotifiesUserAboutFailedLogin` | [Listeners/Security/User/NotifiesUserAboutFailedLogin.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutFailedLogin.php) |
+| **Firefly 自定义** | `UserSuccessfullyLoggedIn` | `StoresNewIpAddress` | [Listeners/Security/User/StoresNewIpAddress.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/StoresNewIpAddress.php) |
+| **Firefly 自定义** | `UserLoggedInFromNewIpAddress` | `NotifiesUserAboutNewIpAddress` | [Listeners/Security/User/NotifiesUserAboutNewIpAddress.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewIpAddress.php) |
+| **Firefly 自定义** | `UserHasEnabledMFA` | `NotifiesUserAboutEnabledMFA` | [Listeners/Security/User/NotifiesUserAboutEnabledMFA.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutEnabledMFA.php) |
+| **Firefly 自定义** | `UserHasUsedBackupCode` | `NotifiesUserAboutUsedBackupCode` | [Listeners/Security/User/NotifiesUserAboutUsedBackupCode.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutUsedBackupCode.php) |
+| **Laravel 内置** | `Illuminate\Auth\Events\Login` | `RespondsToNewLogin` | [Listeners/Security/User/RespondsToNewLogin.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/RespondsToNewLogin.php#L30-L38) |
+| **Passport 内置** | `Laravel\Passport\Events\AccessTokenCreated` | `NotifiesUserAboutNewAccessToken` | [Listeners/Security/User/NotifiesUserAboutNewAccessToken.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php#L30-L42) |
+
+### 2.4 验证方法（可复核）
+
+要手动复核某个监听器到底监听哪个事件，只需两步：
+1. 打开该监听器文件
+2. 查看 `public function handle(XXX $event)` 中 `XXX` 的完整类名 —— 就是它监听的事件
+
 ---
 
-## 三、记录持久化机制（Persistence）
+## 三、生成访问令牌后的安全通知路径（可复核）
 
-Firefly III 采用**双通道持久化**策略：文件审计日志 + 数据库审计表。
+### 3.1 场景背景
 
-### 3.1 通道一：审计日志文件（Audit Log File）
+用户在"个人设置 → OAuth → Personal Access Tokens"页面创建 API Token 时，系统需要通过邮件等渠道通知用户"有新的访问令牌被创建"，以防止令牌被恶意生成。
 
-#### 配置入口：[config/logging.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/config/logging.php)
+### 3.2 完整协作链路
 
-定义了独立的 `audit` 日志通道（第88-91行）：
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 步骤1：前端请求创建 Token                                                  │
+│                                                                         │
+│   [OAuthController::storePersonalAccessToken]                           │
+│   file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/            │
+│          app/Http/Controllers/Profile/OAuthController.php#L187-L194      │
+│                                                                         │
+│   public function storePersonalAccessToken(Request $request): JsonResponse│
+│   {                                                                     │
+│       $this->validation->make(...)->validate();                        │
+│       return response()->json(                                          │
+│           $request->user()->createToken($request->name)  ← 核心调用     │
+│       );                                                                │
+│   }                                                                     │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 步骤2：Laravel Passport 内部创建 Token 并触发事件                         │
+│                                                                         │
+│   User::createToken() (由 Laravel Passport HasApiTokens trait 提供)      │
+│     → 创建 Token 记录到 oauth_access_tokens 表                          │
+│     → 触发事件：Laravel\Passport\Events\AccessTokenCreated              │
+│         携带参数：$userId, $tokenId, $clientId                           │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 步骤3：事件被自动发现 → 路由到监听器                                       │
+│                                                                         │
+│   [NotifiesUserAboutNewAccessToken]                                     │
+│   file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/            │
+│          app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php│
+│                                                                         │
+│   public function handle(AccessTokenCreated $event): void               │
+│   {                                                                     │
+│       $repository = app(UserRepositoryInterface::class);                │
+│       $user       = $repository->find((int) $event->userId);  ← 通过事件 │
+│       if (null !== $user) {                                                          中的 userId 查找 用户   │
+│           NotificationSender::send($user, new NewAccessToken());  ← 发送 │
+│       }                                                                             通知   │
+│   }                                                                     │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 步骤4：NotificationSender 统一入口 → 多渠道分发                           │
+│                                                                         │
+│   [NotificationSender::send]                                            │
+│   file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/            │
+│          app/Notifications/NotificationSender.php#L36-L69               │
+│                                                                         │
+│   1. 读取用户语言偏好（本地化通知内容）                                    │
+│   2. NotificationFacade::locale($lang)->send($user, $notification)      │
+│   3. 捕获异常（Bcc格式错误、RFC 2822 无效等）并记录日志                    │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 步骤5：NewAccessToken 通知类 → 按渠道渲染消息                             │
+│                                                                         │
+│   [NewAccessToken]                                                       │
+│   file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/            │
+│          app/Notifications/User/NewAccessToken.php#L41-L102              │
+│                                                                         │
+│   via()       → ReturnsAvailableChannels::returnChannels('user', $user) │
+│                   返回: [mail, slack, pushover] (根据配置动态)            │
+│                                                                         │
+│   toMail()    → markdown('emails.token-created', [                      │
+│                   'ip', 'host', 'userAgent', 'time', 'link'             │
+│                 ]) → 邮件模板含 IP、UA、时间                               │
+│                                                                         │
+│   toSlack()   → SlackMessage 内容                                        │
+│   toPushover()→ PushoverMessage 推送                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 复核方法
+
+1. 打开 [OAuthController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Profile/OAuthController.php#L187-L194) → 确认 `storePersonalAccessToken` 调用 `createToken()`
+2. 打开 [NotifiesUserAboutNewAccessToken.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php#L34) → 确认 `handle()` 参数为 `AccessTokenCreated`
+3. 打开 [NewAccessToken.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User/NewAccessToken.php#L53-L71) → 确认 `toMail()` 渲染 `emails.token-created` 模板
+
+---
+
+## 四、记录持久化机制（双通道）
+
+### 4.1 通道一：审计日志文件（所有安全事件）
+
+**配置**：[config/logging.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/config/logging.php#L88-L91)
 
 ```php
 'audit' => [
@@ -142,361 +234,234 @@ Firefly III 采用**双通道持久化**策略：文件审计日志 + 数据库�
 ],
 ```
 
-具体输出通道配置（均挂载了 `AuditLogger` 自定义处理器）：
-
-| 通道 | 输出位置 | 保留天数 |
-|------|----------|----------|
-| `audit_daily` | `storage/logs/ff3-audit.log` | 90天 |
-| `audit_stdout` | `php://stdout` (标准输出) | - |
-| `audit_syslog` | 系统 syslog | - |
-| `audit_papertrail` | Papertrail 远程日志 | - |
-| `audit_errorlog` | PHP error_log | - |
-
-#### 自定义处理器：[AuditLogger.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditLogger.php) + [AuditProcessor.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditProcessor.php)
-
-`AuditLogger` 将 `AuditProcessor` 注入到每个日志 Handler 中。`AuditProcessor` 在日志写入前**自动附加安全上下文**：
-
-```php
-// 已登录用户
-AUDIT: {原始消息} ({IP} ({邮箱} -> {HTTP方法}:{URL})
-
-// 未登录用户
-AUDIT: {原始消息} ({IP} -> {HTTP方法}:{URL})
-```
-
-#### 触发记录：代码中直接使用 `Log::channel('audit')`
-
-如 [LoginController.php:89](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php#L89)：
-
-```php
-Log::channel('audit')->info(sprintf('User is trying to login using "%s"', $username));
-Log::channel('audit')->warning(sprintf('Login for user "%s" was locked out.', $username));
-Log::channel('audit')->info(sprintf('User "%s" has been logged in.', $username));
-```
-
-### 3.2 通道二：数据库审计表（audit_log_entries）
-
-#### 表结构：[2022_10_01_210238_audit_log_entries.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/database/migrations/2022_10_01_210238_audit_log_entries.php)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | bigint | 主键 |
-| `auditable_id` + `auditable_type` | int + varchar | **被审计对象**（多态关联，如 TransactionJournal）|
-| `changer_id` + `changer_type` | int + varchar | **操作者**（多态关联，如 User 或 Rule）|
-| `action` | varchar(255) | 操作类型（如 `update_description`, `set_budget`）|
-| `before` | text (JSON cast) | 修改前数据 |
-| `after` | text (JSON cast) | 修改后数据 |
-| `created_at` / `updated_at` | timestamp | 时间戳 |
-| `deleted_at` | timestamp | 软删除 |
-
-#### 模型与仓储
-
-- 模型：[AuditLogEntry.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Models/AuditLogEntry.php) — 使用 `morphTo()` 多态关联
-- 仓储接口：[ALERepositoryInterface.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Repositories/AuditLogEntry/ALERepositoryInterface.php)
-- 仓储实现：[ALERepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Repositories/AuditLogEntry/ALERepository.php)
-
-#### 触发流程：交易规则自动审计
-
-数据库审计主要用于**交易修改追踪**（非用户安全事件），典型链路：
+所有审计通道均挂载 [AuditLogger](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditLogger.php) → 注入 [AuditProcessor](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditProcessor.php)，后者自动在每条日志前补全安全上下文：
 
 ```
-1. 交易规则执行 (app/TransactionRules/Actions/*.php)
-       │
-       ▼  例如: SetDescription.php:73
-2. event(new TransactionGroupRequestsAuditLogEntry(
-       $this->action->rule,    // changer: 触发规则
-       $object,                // auditable: 交易对象
-       'update_description',   // action
-       $before,                // before
-       $after                  // after
-   ));
-       │
-       ▼
-3. StoresAuditLogEntry 监听器（异步队列）
-   [StoresAuditLogEntry.php:35-65]
-   ├── before == after ? 跳过（无变化不记录）
-   ├── Carbon 对象转换为 ISO8601 字符串
-   └── ALERepository::store() → 写入 audit_log_entries 表
+已登录用户格式:
+AUDIT: {原始消息} ({IP} ({邮箱} -> {HTTP方法}:{完整URL})
+
+未登录用户格式:
+AUDIT: {原始消息} ({IP} -> {HTTP方法}:{完整URL})
 ```
 
-目前数据库审计机制**仅用于交易规则操作追踪**，用户安全事件（登录、MFA等）**尚未接入数据库审计表**，仅通过文件日志记录。
+**使用方式**：代码中显式调用 `Log::channel('audit')`，例如：
+- 登录页展示：[LoginController.php:191](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php#L191)
+- 登录失败：[LoginController.php:141](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php#L141)
+- 启用MFA：[MfaController.php:270](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Profile/MfaController.php#L270)
+
+### 4.2 通道二：数据库审计表（交易规则变更）
+
+**表结构**：[database/migrations/2022_10_01_210238_audit_log_entries.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/database/migrations/2022_10_01_210238_audit_log_entries.php#L48-L61)
+
+| 字段 | 说明 |
+|------|------|
+| `auditable_id` + `auditable_type` | 被审计对象（多态关联，如 TransactionJournal）|
+| `changer_id` + `changer_type` | 操作者（多态关联，如 Rule 或 User）|
+| `action` | 操作类型（如 `update_description`, `set_budget`）|
+| `before` | 修改前数据（JSON cast）|
+| `after` | 修改后数据（JSON cast）|
+
+**模型**：[AuditLogEntry.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Models/AuditLogEntry.php)
+**仓储**：[ALERepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Repositories/AuditLogEntry/ALERepository.php#L48-L60)
+
+**注意**：当前数据库审计仅用于**交易规则变更追踪**（如 `SetDescription`、`SetCategory` 等 Action），用户安全事件（登录/MFA/令牌）**未写入此表**，仅通过文件日志记录。
 
 ---
 
-## 四、通知分发机制（Notification Delivery）
+## 五、通知分发机制（可复核）
 
-### 4.1 通知分发完整链路
+### 5.1 分发全链路
 
 ```
-Listener 监听器
-     │
-     ▼  NotificationSender::send($user, new XxxNotification())
-NotificationSender 统一入口
-     │
-     ├── 1. 获取用户语言偏好（本地化）
-     │
-     └── 2. NotificationFacade::locale($lang)->send($user, $notification)
+Listener::handle()
+    │
+    ▼  NotificationSender::send($user, new XxxNotification())
+[NotificationSender.php]
+    ├── 读取用户语言偏好（Preferences::getForUser($user, 'language')）
+    └── NotificationFacade::locale($lang)->send($user, $notification)
               │
               ▼
-        XxxNotification 通知类
-         ├── via()          → 通过 ReturnsAvailableChannels 获取可用渠道
-         ├── toMail()       → 邮件内容（Markdown模板）
-         ├── toSlack()      → Slack 消息
-         ├── toPushover()   → Pushover 推送
-         └── toArray()      → 数据库存储（可选）
+[XxxNotification 类]
+    ├── via()                    → 调用 ReturnsAvailableChannels::returnChannels()
+    ├── toMail() / toSlack()     → 按渠道渲染消息内容
+    │   / toPushover()
+    └── toArray()                → 存入 notifications 表（可选）
+              │
+              ▼
+[ReturnsAvailableChannels.php]
+    ├── 'owner' 类型 → 从 FireflyConfig 读取系统级 Slack/Pushover 配置
+    └── 'user'  类型 → 从 Preferences 读取用户级 Slack/Pushover 配置
+                      mail 始终启用，Demo 站点禁用 mail
 ```
 
-### 4.2 统一发送入口：[NotificationSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/NotificationSender.php)
+### 5.2 核心组件文件（可复核）
 
-职责：
-1. **语言本地化**：从用户偏好读取 `language` 设置通知语言
-2. **统一错误处理**：捕获邮件发送异常（Bcc 格式错误、RFC 2822 无效等）
-3. **支持两种接收者类型**：`User`（普通用户）和 `OwnerNotifiable`（系统所有者虚拟对象）
+| 组件 | 文件路径 |
+|------|---------|
+| 统一发送入口 | [app/Notifications/NotificationSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/NotificationSender.php) |
+| 渠道动态决策 | [app/Notifications/ReturnsAvailableChannels.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/ReturnsAvailableChannels.php) |
+| 登录失败通知 | [app/Notifications/Security/UserFailedLoginAttempt.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/UserFailedLoginAttempt.php) |
+| 新IP登录通知 | [app/Notifications/User/UserLogin.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User/UserLogin.php) |
+| 新令牌通知 | [app/Notifications/User/NewAccessToken.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User/NewAccessToken.php) |
+| MFA启用通知 | [app/Notifications/Security/EnabledMFANotification.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/EnabledMFANotification.php) |
+| 未知用户登录（管理员通知） | [app/Notifications/Admin/UnknownUserLoginAttempt.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin/UnknownUserLoginAttempt.php) |
 
-```php
-public static function send(OwnerNotifiable|User $user, Notification $notification): void
-{
-    // 获取语言
-    $lang = Preferences::getForUser($user, 'language', $lang)->data;
-    
-    try {
-        NotificationFacade::locale($lang)->send($user, $notification);
-    } catch (ClientException $e) {
-        // 处理发送错误
-    }
-}
-```
+### 5.3 复核方法
 
-### 4.3 渠道动态决策：[ReturnsAvailableChannels.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/ReturnsAvailableChannels.php)
-
-根据配置和用户偏好**动态决定**使用哪些通知渠道。核心方法：
-
-```php
-ReturnsAvailableChannels::returnChannels(string $type, ?User $user = null): array
-// $type = 'owner' → 系统所有者渠道
-// $type = 'user'  → 普通用户渠道
-```
-
-#### 系统所有者渠道 (`returnOwnerChannels`)
-
-| 渠道 | 启用条件 | 配置来源 |
-|------|----------|----------|
-| `mail` | 始终启用 | 系统邮件配置 |
-| `slack` | `notifications.channels.slack.enabled = true` + 配置了有效 webhook URL | `FireflyConfig` 加密存储 |
-| `pushover` | `notifications.channels.pushover.enabled = true` + 配置了 AppToken + UserToken | `FireflyConfig` 加密存储 |
-
-#### 普通用户渠道 (`returnUserChannels`)
-
-| 渠道 | 启用条件 | 配置来源 |
-|------|----------|----------|
-| `mail` | 始终启用 | 用户邮箱 |
-| `slack` | 全局 Slack 开启 + 用户配置了有效 webhook | `Preferences` 加密存储 |
-| `pushover` | 全局 Pushover 开启 + 用户配置了双 Token | `Preferences` 加密存储 |
-
-> **注意**：Ntfy 渠道代码存在但被注释禁用。
-
-### 4.4 安全通知类型总览
-
-#### 用户安全通知 ([app/Notifications/Security/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security))
-
-| 通知类 | 触发监听器 | 通知场景 |
-|--------|-----------|----------|
-| [UserFailedLoginAttempt](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/UserFailedLoginAttempt.php) | `NotifiesUserAboutFailedLogin` | 登录失败（含IP、UA、时间）|
-| [EnabledMFANotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/EnabledMFANotification.php) | `NotifiesUserAboutEnabledMFA` | MFA 已启用 |
-| [DisabledMFANotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/DisabledMFANotification.php) | `NotifiesUserAboutDisabledMFA` | MFA 已禁用 |
-| [MFAUsedBackupCodeNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/MFAUsedBackupCodeNotification.php) | `NotifiesUserAboutUsedBackupCode` | 备用码已被使用 |
-| [NewBackupCodesNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/NewBackupCodesNotification.php) | `NotifiesUserAboutNewBackupCodes` | 新备用码已生成 |
-| [MFABackupFewLeftNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/MFABackupFewLeftNotification.php) | `NotifiesUserAboutFewCodesLeft` | 备用码不足警告 |
-| [MFABackupNoLeftNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/MFABackupNoLeftNotification.php) | `NotifiesUserAboutNoCodesLeft` | 备用码用完警告 |
-| [MFAManyFailedAttemptsNotification](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/MFAManyFailedAttemptsNotification.php) | `NotifiesUserAboutRepeatedMFAFailures` | MFA 多次失败 |
-
-#### 管理员通知 ([app/Notifications/Admin/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin))
-
-| 通知类 | 触发监听器 | 通知场景 |
-|--------|-----------|----------|
-| [UnknownUserLoginAttempt](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin/UnknownUserLoginAttempt.php) | `NotifiesOwnerAboutUnknownUser` | 未知用户尝试登录 |
-| [UserRegistration](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin/UserRegistration.php) | `HandlesNewUserRegistration` | 新用户注册通知 |
-| [VersionCheckResult](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin/VersionCheckResult.php) | `NotifiesOwnerAboutNewVersion` | 新版本检测结果 |
-| [UserInvitation](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin/UserInvitation.php) | `NotifiesAboutNewInvitation` | 创建了新邀请 |
-
-#### 用户级其他通知 ([app/Notifications/User/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User))
-
-| 通知类 | 触发监听器 | 通知场景 |
-|--------|-----------|----------|
-| [UserLogin](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User/UserLogin.php) | `NotifiesUserAboutNewIpAddress` | 新IP地址登录 |
-| [UserNewPassword](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User/UserNewPassword.php) | `SendsUserNewPassword` | 密码重置成功 |
-
-### 4.5 通知多渠道实现示例
-
-以 [UserFailedLoginAttempt](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security/UserFailedLoginAttempt.php#L38-L124) 为例，实现了三种消息格式：
-
-```php
-class UserFailedLoginAttempt extends Notification
-{
-    // 1. 决定渠道
-    public function via(User $notifiable): array
-    {
-        $channels = ReturnsAvailableChannels::returnChannels('user', $notifiable);
-        if ($isDemoSite) {
-            return array_diff($channels, ['mail']);  // Demo站点不发邮件
-        }
-        return $channels;
-    }
-
-    // 2. 邮件渠道
-    public function toMail(User $notifiable): MailMessage
-    {
-        return new MailMessage()
-            ->markdown('emails.security.failed-login', [...])
-            ->subject($subject);
-    }
-
-    // 3. Slack 渠道
-    public function toSlack(User $notifiable): SlackMessage
-    {
-        return new SlackMessage()->content($message);
-    }
-
-    // 4. Pushover 渠道
-    public function toPushover(User $notifiable): PushoverMessage
-    {
-        return PushoverMessage::create($body)->title($title);
-    }
-}
-```
+以"登录失败通知"为例：
+1. 打开 [LoginController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php#L133) → 确认触发 `event(new UserFailedLoginAttempt($user))`
+2. 打开 [NotifiesUserAboutFailedLogin.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutFailedLogin.php#L34-L37) → 确认调用 `NotificationSender::send()`
+3. 打开 [NotificationSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/NotificationSender.php#L49) → 确认调用 `NotificationFacade::send()`
+4. 打开 [ReturnsAvailableChannels.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/ReturnsAvailableChannels.php#L91-L132) → 确认渠道决策逻辑
 
 ---
 
-## 五、典型场景完整走查
+## 六、典型场景完整走查
 
 ### 场景A：用户登录失败（已知用户）
 
 ```
- 步骤   组件                                    操作/文件
-────────────────────────────────────────────────────────────────────────
- 1      LoginController::login()               attemptLogin() 返回 false
-        [LoginController.php:125-134]
-        │
- 2      查找用户                                $repository->findByEmail($username)
-        │
- 3      ┌─ 未知用户 ──▶ event(new UnknownUserTriedLogin($username))
-        │
-        └─ 已知用户 ──▶ event(new UserFailedLoginAttempt($user))
+步骤  组件                                    操作
+─────  ─────────────────────────────────────   ───────────────────────────────────
+ 1    LoginController::login()                attemptLogin() 返回 false
+       [LoginController.php:125-134]
+       │
+ 2    查找用户                                 $repository->findByEmail($username)
+       │
+ 3    ├─ 未知用户 → event(new UnknownUserTriedLogin($username))
+       │     └──→ NotifiesOwnerAboutUnknownUser → 管理员通知
+       │
+       └─ 已知用户 → event(new UserFailedLoginAttempt($user))
+                    │
+ 4                  ├── Log::channel('audit')->warning()   写入审计文件
+                  │    [LoginController.php:141]
+                  │
+ 5                  └── handle() 参数推断 → 自动绑定到
+                         NotifiesUserAboutFailedLogin
                               │
- 4                            │   审计日志文件
-                              ├──▶ Log::channel('audit')->warning('Login failed...')
-                              │    [LoginController.php:141]
+ 6                            ▼
+                         NotificationSender::send($user,
+                             new UserFailedLoginAttempt())
                               │
- 5                            │   监听器（异步队列）
-                              └──▶ NotifiesUserAboutFailedLogin::handle()
-                                        │
- 6                                      ▼   统一入口
-                                        NotificationSender::send($user, new UserFailedLoginAttempt())
-                                        │
- 7                                      ▼   渠道决策
-                                        ReturnsAvailableChannels::returnChannels('user', $user)
-                                        │   → [mail, slack, pushover]
-                                        │
- 8                                      ▼   消息渲染 + 发送
-                                        ├── toMail() → markdown emails.security.failed-login
-                                        ├── toSlack() → Slack webhook
-                                        └── toPushover() → Pushover API
+ 7                            ▼
+                         ReturnsAvailableChannels::returnChannels('user', $user)
+                             → [mail, slack, pushover] (动态)
+                              │
+ 8                            ▼
+                         UserFailedLoginAttempt 通知渲染
+                         ├── toMail() → emails.security.failed-login
+                         │     (含 IP、Hostname、UserAgent、时间)
+                         ├── toSlack() → Slack webhook
+                         └── toPushover() → Pushover API
 ```
 
-### 场景B：用户从新IP地址登录成功（事件链 + 偏好存储）
+### 场景B：新IP登录成功（事件链 + 偏好存储）
 
 ```
- 步骤   组件                                    操作
-────────────────────────────────────────────────────────────────────────
- 1      LoginController::login()               event(new UserSuccessfullyLoggedIn($user))
-        [第121行]
-        │
- 2      ├──▶ Log::channel('audit')->info(...)  写入审计文件
-        │
- 3      └──▶ StoresNewIpAddress::handle()      监听器1：IP历史管理
-                ├── 读取 login_ip_history 偏好
-                ├── 遍历检查：IP已存在？刷新时间
-                ├── 清理超过6个月的旧条目
-                ├── 新IP？追加到数组 + 'notified' => false
-                ├── 保存偏好：Preferences::setForUser(...)
-                │
- 4              └── 新IP && 用户开启通知？
+步骤  组件                                    操作
+─────  ─────────────────────────────────────   ───────────────────────────────────
+ 1    LoginController::login()                event(new UserSuccessfullyLoggedIn($user))
+       [第121行]
+       │
+ 2    ├── Log::channel('audit')->info()       写入审计文件
+       │
+ 3    └── 自动发现 → StoresNewIpAddress
+            ├── 读取 login_ip_history 偏好 (JSON数组)
+            ├── 遍历检查：IP已存在？刷新时间
+            ├── 清理 >6个月 的旧条目
+            ├── 新IP？追加: ['ip'=>..., 'time'=>..., 'notified'=>false]
+            └── Preferences::setForUser()     保存偏好
+                 │
+ 4               └── 新IP && 用户开启通知？
                         event(new UserLoggedInFromNewIpAddress($user))
                               │
- 5                              ▼
-                        NotifiesUserAboutNewIpAddress::handle()
-                        ├── 再次读取 login_ip_history
-                        ├── 遍历 notified=false 的条目
-                        │     └── NotificationSender::send($user, new UserLogin())
-                        ├── 全部标记 notified=true
-                        └── 保存偏好
+ 5                            ▼
+                       NotifiesUserAboutNewIpAddress
+                       ├── 读取 login_ip_history
+                       ├── 遍历 notified=false 的条目
+                       │     └── NotificationSender::send($user, new UserLogin())
+                       ├── 全部标记 notified=true
+                       └── Preferences::setForUser()   保存偏好
 ```
 
-### 场景C：交易规则修改描述 → 数据库审计
+### 场景C：生成新访问令牌（Passport 内部事件）
 
-```
- 步骤   组件                                    操作
-────────────────────────────────────────────────────────────────────────
- 1      TransactionRule 引擎 执行 SetDescription Action
-        [SetDescription.php]
-        │
- 2      event(new TransactionGroupRequestsAuditLogEntry(
-                  changer: Rule对象,      （谁发起的修改）
-                  auditable: Journal对象, （被修改的东西）
-                  field: 'update_description',
-                  before: $before,
-                  after: $text
-              ))
-        │
- 3      ▼  监听器（异步队列）
-        StoresAuditLogEntry::handle()
-        ├── before === after ? 跳过（优化）
-        ├── Carbon → ISO8601 格式转换
-        └── ALERepository::store($data)
-                │
- 4              ▼  数据库写入
-                AuditLogEntry 模型
-                → auditable_id/auditable_type  (Journal)
-                → changer_id/changer_type      (Rule)
-                → action='update_description'
-                → before / after (JSON cast)
-                → INSERT INTO audit_log_entries
-```
+详见第三章完整链路。核心要点：
+- **触发点**：`OAuthController::storePersonalAccessToken()` 调用 `$user->createToken()`
+- **事件源**：Passport 内部触发 `Laravel\Passport\Events\AccessTokenCreated`
+- **监听器绑定**：通过 `handle(AccessTokenCreated $event)` 参数类型自动发现
+- **通知渠道**：mail / slack / pushover，内容包含创建者 IP、UA、时间
 
 ---
 
-## 六、设计要点总结
+## 七、关键文件速查表（链接可复核）
 
-### 6.1 架构优势
+### 事件发现与绑定
 
-1. **解耦分层**：事件（数据）→ 监听器（逻辑）→ 通知（分发）三层分离，单一职责
-2. **异步处理**：几乎所有安全监听器都实现 `ShouldQueue` 接口，避免阻塞用户请求
-3. **双轨记录**：文件日志（人可读+完整上下文）+ 数据库表（结构化查询）互补
-4. **动态渠道**：`ReturnsAvailableChannels` 按配置/偏好动态决定通知渠道，扩展性好
-5. **多语言支持**：通知发送前自动读取用户语言偏好
+| 文件 | 作用 |
+|------|------|
+| [app/Providers/EventServiceProvider.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Providers/EventServiceProvider.php) | 继承 Laravel 基类，获得自动发现能力 |
+| [app/Listeners/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners) | 此目录下所有类被自动扫描为监听器候选 |
 
-### 6.2 值得注意的细节
+### 用户安全事件
 
-1. **用户安全事件未接入数据库审计表**：登录/MFA等安全事件仅写入 `audit` 日志文件，未进入 `audit_log_entries` 表。目前该表只服务于交易规则变更追踪。
-2. **事件自动发现**：`EventServiceProvider::$listen` 基本为空，依赖 Laravel 事件自动发现机制，监听器与事件通过 `handle()` 方法参数类型隐式绑定
-3. **Demo 站点特殊处理**：通知类的 `via()` 方法中会判断 `is_demo_site`，Demo 环境不发送邮件
-4. **IP 历史存储在 Preferences**：不是独立数据表，而是用户偏好 JSON 数组（带过期清理）
-5. **双重通知对象**：系统级事件（如未知用户登录）通知发给虚拟的 `OwnerNotifiable`，而非真实 User 对象
-6. **交易审计支持"无变化跳过"优化**：`StoresAuditLogEntry` 在 `before === after` 时直接跳过，减少无效记录
+| 事件类 | 所在目录 |
+|--------|---------|
+| UserSuccessfullyLoggedIn / UserFailedLoginAttempt 等 12 种 | [app/Events/Security/User/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/User) |
+| UnknownUserTriedLogin / NewUserRegistered 等 5 种 | [app/Events/Security/System/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security/System) |
 
-### 6.3 关键文件速查表
+### 用户安全监听器
 
-| 层级 | 文件路径 |
+| 监听器目录 |
+|-----------|
+| [app/Listeners/Security/User/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User) |
+| [app/Listeners/Security/System/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/System) |
+
+### 持久化相关
+
+| 文件 | 作用 |
+|------|------|
+| [config/logging.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/config/logging.php) | 审计日志通道配置 |
+| [app/Support/Logging/AuditProcessor.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditProcessor.php) | 自动注入 IP/用户/URL 上下文 |
+| [app/Models/AuditLogEntry.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Models/AuditLogEntry.php) | 数据库审计表模型 |
+| [app/Repositories/AuditLogEntry/ALERepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Repositories/AuditLogEntry/ALERepository.php) | 审计仓储实现 |
+
+### 通知分发相关
+
+| 文件 | 作用 |
+|------|------|
+| [app/Notifications/NotificationSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/NotificationSender.php) | 统一发送入口（本地化+异常处理） |
+| [app/Notifications/ReturnsAvailableChannels.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/ReturnsAvailableChannels.php) | 渠道动态决策器 |
+| [app/Notifications/Security/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security) | 安全通知类（MFA/登录等） |
+| [app/Notifications/User/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/User) | 用户通知类（新IP/新令牌等） |
+| [app/Notifications/Admin/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Admin) | 管理员通知类（未知用户/新注册等） |
+
+### 关键触发控制器
+
+| 文件 | 触发事件 |
 |------|---------|
-| **事件定义** | [app/Events/Security/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Events/Security) |
-| **用户安全监听器** | [app/Listeners/Security/User/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/User) |
-| **系统安全监听器** | [app/Listeners/Security/System/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Security/System) |
-| **交易审计监听器** | [app/Listeners/Model/TransactionGroup/StoresAuditLogEntry.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Listeners/Model/TransactionGroup/StoresAuditLogEntry.php) |
-| **通知发送入口** | [app/Notifications/NotificationSender.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/NotificationSender.php) |
-| **渠道决策器** | [app/Notifications/ReturnsAvailableChannels.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/ReturnsAvailableChannels.php) |
-| **安全通知类** | [app/Notifications/Security/](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Notifications/Security) |
-| **审计日志配置** | [config/logging.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/config/logging.php) |
-| **审计处理器** | [app/Support/Logging/AuditProcessor.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Support/Logging/AuditProcessor.php) |
-| **审计日志模型** | [app/Models/AuditLogEntry.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Models/AuditLogEntry.php) |
-| **审计日志仓储** | [app/Repositories/AuditLogEntry/ALERepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Repositories/AuditLogEntry/ALERepository.php) |
-| **事件服务提供者** | [app/Providers/EventServiceProvider.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Providers/EventServiceProvider.php) |
+| [app/Http/Controllers/Auth/LoginController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/LoginController.php) | UserSuccessfullyLoggedIn, UserFailedLoginAttempt, UnknownUserTriedLogin |
+| [app/Http/Controllers/Profile/MfaController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Profile/MfaController.php) | UserHasEnabledMFA, UserHasDisabledMFA, UserHasGeneratedNewBackupCodes |
+| [app/Http/Controllers/Profile/OAuthController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Profile/OAuthController.php) | createToken() → Passport 触发 AccessTokenCreated |
+| [app/Http/Controllers/Auth/TwoFactorController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/129-firefly-iii/app/Http/Controllers/Auth/TwoFactorController.php) | UserHasUsedBackupCode |
+
+---
+
+## 八、设计要点总结
+
+### 8.1 已修正的三处关键信息
+
+| 原描述问题 | 修正后实际情况 | 复核依据 |
+|-----------|--------------|---------|
+| 事件绑定通过 `#[Subscribe]` 属性 | 绑定通过 `handle()` 方法参数类型声明完成，由基类 `discoverEvents()` 扫描 | 每个监听器的 `handle(EventClass $event)` 参数 |
+| 未提及访问令牌通知路径 | `OAuthController::storePersonalAccessToken()` → `createToken()` → Passport `AccessTokenCreated` 事件 → `NotifiesUserAboutNewAccessToken` → `NewAccessToken` 通知 | 第三章完整链路 + 对应源码文件 |
+| 链接使用 Windows 反斜杠路径 | 统一使用 `file:///d:/...` 格式正斜杠绝对路径 | 本文档所有链接 |
+
+### 8.2 架构设计特征
+
+1. **零配置绑定**：依赖 Laravel 约定优于配置，`$listen` 数组全注释仍能工作
+2. **异步非阻塞**：几乎所有监听器实现 `ShouldQueue`，登录/MFA/令牌等关键操作不阻塞 HTTP 请求
+3. **双轨记录**：文件日志（全量安全事件，含上下文）+ 数据库表（结构化交易变更）
+4. **渠道可配置**：通知渠道按 owner/user 分级，从 FireflyConfig（系统级）和 Preferences（用户级）分别读取
+5. **事件可链式触发**：一个监听器可在内部 `event()` 触发新事件（如 `StoresNewIpAddress` → `UserLoggedInFromNewIpAddress`）
+6. **Demo 环境保护**：通知类 `via()` 方法中判断 `is_demo_site`，自动禁用邮件渠道防止垃圾邮件
