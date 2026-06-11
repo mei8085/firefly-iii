@@ -552,34 +552,139 @@ private function collectDatesFromJournals(Collection $journals): Collection
 }
 ```
 
-- 直接从 transaction_journals 表的 `date` 字段提取
+- 直接从 `$journals` 集合里每个 journal 的 `date` 属性提取（不是查数据库，是内存中已有对象的属性）
 - 如果 journals 为空（理论上不该发生），回退为当前时间
 
-**更新时日期集合包含新旧两套**：
-app/Api/V1/Controllers/Models/Transaction/UpdateController.php #L80-L83
+**⚠️ 更新时 dates 里只有新日期，旧日期不会进入周期统计删除条件**
+
+完整更新流程（以 app/Api/V1/Controllers/Models/Transaction/UpdateController.php #L80-L83 为例）：
+
 ```php
-$objects = TransactionGroupEventObjects::collectFromTransactionGroup($transactionGroup); // 旧的
-$transactionGroup = $this->groupRepository->update($transactionGroup, $data);          // 更新
-$objects->appendFromTransactionGroup($transactionGroup);                               // 追加上新的
+// 步骤1：先从数据库收集旧的 group+journals
+$objects = TransactionGroupEventObjects::collectFromTransactionGroup($transactionGroup);
+
+// 步骤2：执行更新（修改数据库和内存中的 journal 对象）
+$transactionGroup = $this->groupRepository->update($transactionGroup, $data);
+
+// 步骤3：再次 append 同一个 group（refresh 后的新对象）
+$objects->appendFromTransactionGroup($transactionGroup);
 ```
 
-所以更新事件的 dates 是**旧日期 + 新日期**的并集。哪怕只改了日期字段，两个日期都会进入删除条件。
+看起来步骤1和步骤3各收集了一次，应该有新旧两套。但实际有两个机制使旧日期丢失：
 
-### 6.4 对象集合的收集：TransactionGroupEventObjects
+#### 机制 A：PHP 对象引用导致第一个 journal 实例的 date 已经被改成新值
+
+步骤1收集 journal 时，push 到 `$this->transactionJournals` 的是**对象引用**。
+步骤2的 update 过程中，JournalUpdateService（app/Services/Internal/Update/JournalUpdateService.php #L669）直接修改了内存中同一个 journal 对象实例的 date：
+
+```php
+// JournalUpdateService::updateField('date')
+$this->transactionJournal->{$fieldName} = $value;  // 直接修改原对象属性
+```
+
+所以虽然 unique 之后保留了步骤1 push 进去的「第一个」journal，但它的 date 属性已经在步骤2被改成新值了。
+
+#### 机制 B：unique('id') 保留第一个，丢弃 refresh 后的新实例
+
+步骤3 append 时再次 `push` 同一个 journal id 的新实例（refresh 后重新从 DB 加载的对象）。但 `appendFromTransactionGroup` 末尾调用了 `$this->transactionJournals->unique('id')`，Laravel Collection 的 unique() 行为是保留**第一次出现**的元素，丢弃后续同 id 的元素。
+
+所以 refresh 后的新 journal 实例（date 也是新值，和第一个一致）被丢弃。
+
+**最终效果**：`collectDatesFromJournals()` 拿到的 dates 里，每个 journal 只出现一次，且 date 是**更新后的新值**。旧日期不会进入删除条件。
+
+---
+
+### 6.4 对象集合的收集与去重机制
 
 **位置**：app/Events/Model/TransactionGroup/TransactionGroupEventObjects.php
 
-通过 `collectFromTransactionGroup()` 收集，再通过 `appendFromTransactionGroup()` 追加，所有对象都 `unique('id')` 去重。
+#### appendFromTransactionGroup() 的完整流程
+
+```php
+public function appendFromTransactionGroup(TransactionGroup $transactionGroup): void
+{
+    $this->transactionGroups->push($transactionGroup);
+    foreach ($transactionGroup->transactionJournals as $journal) {
+        $this->transactionJournals->push($journal);           // 1. 先 push
+        $this->budgets    = $this->budgets->merge($journal->budgets);
+        $this->categories = $this->categories->merge($journal->categories);
+        $this->tags       = $this->tags->merge($journal->tags);
+        foreach ($journal->transactions as $transaction) {
+            $this->accounts->push($transaction->account);
+        }
+    }
+    // 2. 末尾统一 unique('id') 去重：保留第一个出现的元素，丢弃后续同 id 的
+    $this->transactionGroups   = $this->transactionGroups->unique('id');
+    $this->transactionJournals = $this->transactionJournals->unique('id');
+    $this->budgets             = $this->budgets->unique('id');
+    $this->categories          = $this->categories->unique('id');
+    $this->tags                = $this->tags->unique('id');
+    $this->accounts            = $this->accounts->unique('id');
+}
+```
 
 收集规则：
-- accounts：遍历所有 transaction → account（即每个拆分的两方账户）
+- accounts：遍历所有 transaction → account（每个拆分的两方账户）
 - budgets：journal->budgets（一对多）
 - categories：journal->categories（一对多）
-- tags：journal->tags（多对多，通过中间表）
+- tags：journal->tags（多对多）
 - transactionJournals：组内所有 journals
 - transactionGroups：组本身
 
-更新时同样收集**旧对象 + 新对象**的并集。
+#### 去重对更新场景的影响
+
+对于 accounts/budgets/categories/tags 这些「基本不会因日期修改而变化」的对象，unique 前后没区别。
+对于 transactionJournals，因上面的对象引用机制，unique 后保留的是「第一个 push 但 date 已被改成新值」的那个实例。
+
+---
+
+### 6.5 为什么运行余额用了 _internal_previous_date 但周期统计删除没用
+
+**两者的区别**：
+
+| 维度 | 周期统计缓存删除 | 运行余额重算 |
+|------|----------------|------------|
+| 方法 | `collectDatesFromJournals()` | `recalculateRunningBalance()` + `getFromInternalDate()` |
+| 日期来源 | `$journals->pluck('date')`（内存对象的属性） | `pluck('date')` + `transaction_journal_meta` 表的 `_internal_previous_date` |
+| 位置 | SupportsGroupProcessingTrait #L106 | SupportsGroupProcessingTrait #L68-L91 + #L157-L172 |
+
+#### _internal_previous_date 是什么时候写入的
+
+app/Services/Internal/Update/JournalUpdateService.php #L630-L657 中的 `updateField('date')`：
+
+```php
+$res = $value->gt($this->transactionJournal->date);  // 新日期 > 旧日期？
+$set = ['journal' => $this->transactionJournal, 'name' => '_internal_previous_date', 'data' => null];
+if ($res) {
+    // 只在"把日期往后改"时，才把旧日期存到 _internal_previous_date 元字段
+    $set['data'] = clone $this->transactionJournal->date;
+}
+// 如果是"往回改日期"，不存这个字段（data=null）
+$factory->updateOrCreate($set);
+```
+
+**也就是说，_internal_previous_date 只在「新日期 > 旧日期」时才有值。**
+
+#### 运行余额重算怎么用的
+
+app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php #L80-L84：
+
+```php
+$earliest         = $objects->transactionJournals->pluck('date')->sort()->first();
+$fromInternalDate = $this->getFromInternalDate($objects->transactionJournals->pluck('id')->toArray());
+$earliest         = $fromInternalDate->lt($earliest) ? $fromInternalDate : $earliest;
+```
+
+`getFromInternalDate()` 额外查询 `transaction_journal_meta` 表拿到所有 `_internal_previous_date`，取其中最早的那个。运行余额重算需要从「最早受影响的日期」开始重算，所以必须把旧日期也考虑进来。
+
+#### 为什么周期统计删除没这样做
+
+这是代码的设计遗漏（或者说 bug）：
+- `removePeriodStatistics()` 的 `collectDatesFromJournals()` 直接从内存对象 pluck date，只拿到新日期
+- 没有查询 `_internal_previous_date` 元字段
+- 也没有额外的逻辑尝试获取旧日期
+
+**后果**：当交易从 1月改到 2月时，1月的周期统计不会被失效删除（因为删除条件里只有 2月15日，不落在 1月的 start..end 区间里），只有 2月及更大粒度的周期会被删除。这和 AND 叠加效应一起，使细粒度周期统计的数据一致性问题更加严重。
 
 ### 6.5 多日期删除条件的 SQL 逻辑：AND 叠加（注意：不是 OR）
 
