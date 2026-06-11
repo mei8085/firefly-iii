@@ -1,6 +1,6 @@
 # Firefly III 安全事件：触发、发现、持久化与通知分发协作机制
 
-本文档详细梳理安全相关事件从**触发** → **事件发现与绑定** → **记录持久化** → **通知分发**的完整协作链路。
+本文档基于代码事实梳理安全相关事件从**触发** → **事件发现与绑定** → **记录持久化** → **通知分发**的完整协作链路。
 
 ---
 
@@ -35,13 +35,11 @@
                ▼                ▼                     ▼
   ┌──────────────────┐ ┌─────────────────────┐ ┌───────────────────┐
   │ 审计日志文件      │ │ 数据库审计表         │ │ 通知分发           │
-  │ (Controller 直写)│ │ (Listener 间写)      │ │ (Listener 触发)   │
+  │ (多模块直写)      │ │ (Listener 间写)      │ │ (Listener 触发)   │
   │ Log::channel     │ │ ALERepository       │ │ NotificationSender│
   │ ('audit')        │ │ ::store()           │ │ ::send()          │
   └──────────────────┘ └─────────────────────┘ └───────────────────┘
 ```
-
-**关键分工**：审计日志写入由**控制器直接调用** `Log::channel('audit')` 完成（与事件监听器无关），通知分发由**监听器**触发。
 
 ---
 
@@ -73,7 +71,7 @@ bootstrap/app.php                           ← 应用实例创建入口
             └── ... (其他 ServiceProvider)
 ```
 
-### 2.2 核心发现：withEvents(discover:) 才是真正入口
+### 2.2 核心发现：withEvents(discover:) 是真正入口
 
 在 `bootstrap/app.php` 第166-168行：
 
@@ -93,7 +91,7 @@ bootstrap/app.php                           ← 应用实例创建入口
 
 这意味着 `EventServiceProvider::$listen` 数组中的映射**完全不生效**（该数组本身也是全注释状态），事件绑定**完全依赖** `withEvents(discover:)` 的自动发现机制。
 
-### 2.3 发现规则的完整执行流程
+### 2.3 发现规则的执行流程
 
 ```
 Laravel 框架启动
@@ -134,41 +132,40 @@ Laravel 框架启动
 
 ## 三、审计日志记录细节
 
-### 3.1 审计日志不由监听器写入，由控制器直写
+### 3.1 令牌创建路径无审计日志写入
 
-审计日志的写入**发生在事件触发之前**（或在事件触发的同一个控制器方法中），是通过 `Log::channel('audit')` **直接调用**完成的，**不经过监听器**。
-
-**示例** — `app/Http/Controllers/Auth/LoginController.php` 登录流程：
+`OAuthController::storePersonalAccessToken`（创建个人访问令牌的方法）中**没有** `Log::channel('audit')` 调用，令牌创建路径不直接写入审计日志。
 
 ```php
-// 第89行：尝试登录前就写审计
-Log::channel('audit')->info(sprintf('User is trying to login using "%s"', $username));
+// app/Http/Controllers/Profile/OAuthController.php#L187-L194
+public function storePersonalAccessToken(Request $request): JsonResponse
+{
+    $this->validation->make($request->only(['name']), [
+        'name' => ['required', 'max:255'],
+    ])->validate();
 
-// 第107行：被锁定也写审计
-Log::channel('audit')->warning(sprintf('Login for user "%s" was locked out.', ...));
-
-// 第114行：登录成功也写审计
-Log::channel('audit')->info(sprintf('User "%s" has been logged in.', ...));
-event(new UserSuccessfullyLoggedIn(...));  // ← 事件触发在日志之后
-
-// 第141行：登录失败也写审计
-Log::channel('audit')->warning(sprintf('Login failed. Attempt for user "%s" failed.', ...));
-event(new UserFailedLoginAttempt(...));     // ← 事件触发在日志之后
+    return response()->json($request->user()->createToken($request->name));
+}
 ```
 
-**示例** — `app/Http/Controllers/Auth/TwoFactorController.php` MFA 验证：
+### 3.2 审计日志的调用者分布于四类文件
 
-```php
-// 第89行：MFA失败计数审计
-Log::channel('audit')->info(sprintf('User "%s" has had %d failed MFA attempts.', ...));
-event(new UserKeepsFailingMFA(...));  // ← 审计日志先于事件
+`Log::channel('audit')` 的调用不限于控制器，实际分布如下：
 
-// 第117行：使用备用码审计
-Log::channel('audit')->info(sprintf('User "%s" has used a backup code.', ...));
-event(new UserHasUsedBackupCode(...));  // ← 审计日志先于事件
-```
+| 调用位置类别 | 示例文件 | 典型用途 |
+|------------|---------|---------|
+| **Controllers** | `app/Http/Controllers/Auth/LoginController.php` | 登录/登出/MFA 等安全操作 |
+| **Controllers** | `app/Http/Controllers/Profile/MfaController.php` | MFA 启用/禁用/生成备份码 |
+| **Controllers** | `app/Http/Controllers/Admin/*` | 管理员操作（货币/链接/配置等）|
+| **Rules** | `app/Rules/IsValidAmount.php` | 金额验证规则执行 |
+| **Rules** | `app/Rules/Admin/IsValidSlackUrl.php` | Slack URL 验证 |
+| **Repositories** | `app/Repositories/Tag/TagRepository.php` | `destroyAll()` 批量删除操作 |
+| **Repositories** | `app/Repositories/Budget/BudgetRepository.php` | `destroyAll()` 批量删除操作 |
+| **Http/Requests** | `app/Http/Requests/*FormRequest.php` | 表单验证失败记录 |
 
-### 3.2 AuditProcessor 上下文注入时机
+**调用时机说明**：安全相关操作的审计日志调用通常发生在 `event()` 触发**之前**（或同一方法内的邻近位置），与事件监听器无依赖关系。
+
+### 3.3 AuditProcessor 上下文注入时机
 
 审计日志通道在 `config/logging.php` 中配置，所有 `audit_*` 通道都通过 `tap` 挂载 `AuditLogger` 类：
 
@@ -202,9 +199,9 @@ Log::channel('audit')->info('消息')
     └── 未登录用户 → "AUDIT: {消息} ({IP} -> {方法}:{URL})"
 ```
 
-**关键细节**：`AuditProcessor` 在每条日志写入**之前**注入上下文，它通过 `auth()->check()` 判断用户是否已登录，通过 `request()->ip()` 获取 IP，通过 `request()->method()` 和 `request()->url()` 获取请求信息。这意味着审计日志的上下文是**实时捕获**的，反映的是日志写入那一刻的请求状态。
+`AuditProcessor` 在每条日志写入前通过 `auth()->check()` 判断用户登录状态，通过 `request()->ip()`、`request()->method()`、`request()->url()` 获取请求信息，反映的是日志写入那一刻的请求状态。
 
-### 3.3 审计日志通道选择
+### 3.4 审计日志通道选择
 
 审计日志通道由环境变量 `AUDIT_LOG_CHANNEL` 控制：
 
@@ -226,9 +223,9 @@ if (in_array($auditLogChannel, $validAuditChannels, true)) {
 | `audit_papertrail` | Papertrail 远程日志 | - |
 | `audit_errorlog` | PHP error_log | - |
 
-### 3.4 数据库审计表（仅交易规则变更）
+### 3.5 数据库审计表（仅交易规则变更）
 
-`audit_log_entries` 数据库表**仅用于交易规则变更追踪**（由 `StoresAuditLogEntry` 监听器写入），用户安全事件**不写入此表**。
+`audit_log_entries` 数据库表仅用于交易规则变更追踪（由 `StoresAuditLogEntry` 监听器写入），用户安全事件不写入此表。
 
 ---
 
@@ -245,11 +242,9 @@ if (in_array($auditLogChannel, $validAuditChannels, true)) {
 步骤2  Laravel Passport 内部
        │  → 写入 oauth_access_tokens 表
        │  → event(new Laravel\Passport\Events\AccessTokenCreated($userId, $tokenId, $clientId))
-       │     ↑ 注意：这是 Passport 包内部触发的事件，非 Firefly 代码
        │
-步骤3  NotifiesUserAboutNewAccessToken（同步执行！）
+步骤3  NotifiesUserAboutNewAccessToken（未实现 ShouldQueue）
        app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php#L32-L43
-       │  ※ 未实现 ShouldQueue 接口 → 在当前请求周期内同步执行
        │
        │  $user = $repository->find((int) $event->userId);
        │  NotificationSender::send($user, new NewAccessToken());
@@ -269,46 +264,55 @@ if (in_array($auditLogChannel, $validAuditChannels, true)) {
 
 ### 4.2 令牌通知的异步处理差异
 
-`NotifiesUserAboutNewAccessToken` 是安全监听器中**唯一未实现 `ShouldQueue`** 的监听器，它**同步执行**：
+`NotifiesUserAboutNewAccessToken` 未实现 `ShouldQueue` 接口。以下是所有19个安全监听器的实现状态：
 
-| 监听器 | 实现 ShouldQueue? | 执行方式 |
-|--------|------------------|---------|
-| `NotifiesUserAboutFailedLogin` | ✅ | 可异步 |
-| `NotifiesUserAboutEnabledMFA` | ✅ | 可异步 |
-| `NotifiesUserAboutDisabledMFA` | ✅ | 可异步 |
-| `NotifiesUserAboutUsedBackupCode` | ✅ | 可异步 |
-| `NotifiesUserAboutNewBackupCodes` | ✅ | 可异步 |
-| `NotifiesUserAboutFewCodesLeft` | ✅ | 可异步 |
-| `NotifiesUserAboutNoCodesLeft` | ✅ | 可异步 |
-| `NotifiesUserAboutRepeatedMFAFailures` | ✅ | 可异步 |
-| `NotifiesUserAboutNewIpAddress` | ✅ | 可异步 |
-| `StoresNewIpAddress` | ✅ | 可异步 |
-| `RespondsToNewLogin` | ✅ | 可异步 |
-| `SendsUserNewPassword` | ✅ | 可异步 |
-| `HandlesChangeOfUserEmailAddress` | ✅ | 可异步 |
-| `NotifiesOwnerAboutUnknownUser` | ✅ | 可异步 |
-| `HandlesNewUserRegistration` | ✅ | 可异步 |
-| `NotifiesOwnerAboutNewVersion` | ✅ | 可异步 |
-| `ChecksForNewVersion` | ✅ | 可异步 |
-| `NotifiesAboutNewInvitation` | ✅ | 可异步 |
-| **`NotifiesUserAboutNewAccessToken`** | **❌** | **同步** |
+**User 安全监听器（14个）**：
+
+| 监听器类 | 实现 ShouldQueue? |
+|---------|------------------|
+| `NotifiesUserAboutFailedLogin` | ✅ |
+| `NotifiesUserAboutEnabledMFA` | ✅ |
+| `NotifiesUserAboutDisabledMFA` | ✅ |
+| `NotifiesUserAboutUsedBackupCode` | ✅ |
+| `NotifiesUserAboutNewBackupCodes` | ✅ |
+| `NotifiesUserAboutFewCodesLeft` | ✅ |
+| `NotifiesUserAboutNoCodesLeft` | ✅ |
+| `NotifiesUserAboutRepeatedMFAFailures` | ✅ |
+| `NotifiesUserAboutNewIpAddress` | ✅ |
+| `StoresNewIpAddress` | ✅ |
+| `RespondsToNewLogin` | ✅ |
+| `SendsUserNewPassword` | ✅ |
+| `HandlesChangeOfUserEmailAddress` | ✅ |
+| **`NotifiesUserAboutNewAccessToken`** | **❌** |
+
+**System 安全监听器（5个）**：
+
+| 监听器类 | 实现 ShouldQueue? |
+|---------|------------------|
+| `NotifiesOwnerAboutUnknownUser` | ✅ |
+| `HandlesNewUserRegistration` | ✅ |
+| `NotifiesOwnerAboutNewVersion` | ✅ |
+| `ChecksForNewVersion` | ✅ |
+| `NotifiesAboutNewInvitation` | ✅ |
+
+**总计**：19个安全监听器，18个实现了 `ShouldQueue`，`NotifiesUserAboutNewAccessToken` 未实现。
 
 ### 4.3 队列配置对异步的实际影响
 
-即使监听器实现了 `ShouldQueue`，**实际是否异步取决于队列驱动配置**：
+即使监听器实现了 `ShouldQueue`，实际是否异步取决于队列驱动配置：
 
 ```php
 // config/queue.php 第37行
 'default' => env('QUEUE_CONNECTION', 'sync'),
 ```
 
-| `QUEUE_CONNECTION` 值 | ShouldQueue 监听器行为 | NotifiesUserAboutNewAccessToken 行为 |
-|----------------------|----------------------|-------------------------------------|
-| `sync`（默认） | **同步执行**（派发后立即在同进程执行） | 同步执行 |
+| `QUEUE_CONNECTION` 值 | 实现 ShouldQueue 的监听器 | 未实现 ShouldQueue 的监听器 |
+|----------------------|------------------------|--------------------------|
+| `sync`（默认） | 同步执行（派发后立即在同进程执行） | 同步执行 |
 | `database` | 异步执行（写入 jobs 表，由 queue worker 消费） | 同步执行 |
 | `redis` | 异步执行（写入 Redis 队列） | 同步执行 |
 
-**结论**：默认配置下所有监听器都是同步执行的。`NotifiesUserAboutNewAccessToken` 无论队列配置如何都**始终同步**执行——这意味着创建访问令牌时，通知发送会阻塞 HTTP 响应，用户需等待邮件/Slack/Pushover 发送完成后才能收到响应。
+默认配置下所有监听器均为同步执行。`NotifiesUserAboutNewAccessToken` 无论队列配置如何都同步执行——在当前配置下，这与其他监听器的行为没有区别。
 
 ---
 
@@ -333,23 +337,38 @@ Listener::handle()
 
 ### 5.2 渠道动态决策
 
-`ReturnsAvailableChannels::returnChannels($type, $user)` 根据类型和配置动态返回渠道列表：
+#### Owner 类型（管理员通知）
 
-**owner 类型**（管理员通知）— 从 `FireflyConfig` 读取系统级配置：
+从 `FireflyConfig` 读取系统级配置：
 
 | 渠道 | 启用条件 | 配置来源 |
 |------|---------|---------|
 | `mail` | 始终启用 | `config('firefly.site_owner')` 邮箱 |
-| `slack` | `notifications.channels.slack.enabled` + 有效 webhook URL | `FireflyConfig` 加密存储 |
-| `pushover` | `notifications.channels.pushover.enabled` + 双 Token | `FireflyConfig` 加密存储 |
+| `slack` | `config('notifications.channels.slack.enabled') === true` + 有效 webhook URL | `FireflyConfig` 加密存储 |
+| `pushover` | `config('notifications.channels.pushover.enabled') === true` + `pushover_app_token` 非空 + `pushover_user_token` 非空 | `FireflyConfig` 加密存储 |
 
-**user 类型**（用户通知）— 从 `Preferences` 读取用户级配置：
+#### User 类型（用户通知）
+
+从 `Preferences` 读取用户级配置：
 
 | 渠道 | 启用条件 | 配置来源 |
 |------|---------|---------|
 | `mail` | 始终启用（Demo站点除外） | 用户邮箱 |
-| `slack` | 全局 Slack 开启 + 用户配置有效 webhook | `Preferences` 加密存储 |
-| `pushover` | 全局 Pushover 开启 + 用户配置双 Token | `Preferences` 加密存储 |
+| `slack` | `config('notifications.channels.slack.enabled') === true` + 有效 webhook URL | `Preferences` 加密存储 |
+| `pushover` | `config('notifications.channels.slack.enabled') === true` + `pushover_app_token` 非空 + `pushover_user_token` 非空 | `Preferences` 加密存储 |
+
+**注意**：用户 Pushover 渠道的开关条件检查的是 `notifications.channels.slack.enabled` 配置（而非 `notifications.channels.pushover.enabled`）。相关代码见 `app/Notifications/ReturnsAvailableChannels.php#L116`：
+
+```php
+// returnUserChannels() 方法第116行
+if (true === config('notifications.channels.slack.enabled', false)) {
+    $pushoverAppToken  = (string) Preferences::getEncryptedForUser($user, 'pushover_app_token', '')->data;
+    $pushoverUserToken = (string) Preferences::getEncryptedForUser($user, 'pushover_user_token', '')->data;
+    if ('' !== $pushoverAppToken && '' !== $pushoverUserToken) {
+        $channels[] = PushoverChannel::class;
+    }
+}
+```
 
 ### 5.3 通知可配置性
 
@@ -357,20 +376,20 @@ Listener::handle()
 
 ```php
 // config/notifications.php notifications.user 部分
-'new_access_token'     => ['enabled' => true, 'configurable' => true],   // 用户可在UI关闭
-'user_login'           => ['enabled' => true, 'configurable' => true],   // 用户可在UI关闭
-'login_failure'        => ['enabled' => true, 'configurable' => true],   // 用户可在UI关闭
-'enabled_mfa'          => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'disabled_mfa'         => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'new_password'         => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'few_left_mfa'         => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'no_left_mfa'          => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'many_failed_mfa'      => ['enabled' => true, 'configurable' => false],  // 不可关闭
-'new_backup_codes'     => ['enabled' => true, 'configurable' => false],  // 不可关闭
+'new_access_token'     => ['enabled' => true, 'configurable' => true],
+'user_login'           => ['enabled' => true, 'configurable' => true],
+'login_failure'        => ['enabled' => true, 'configurable' => true],
+'enabled_mfa'          => ['enabled' => true, 'configurable' => false],
+'disabled_mfa'         => ['enabled' => true, 'configurable' => false],
+'new_password'         => ['enabled' => true, 'configurable' => false],
+'few_left_mfa'         => ['enabled' => true, 'configurable' => false],
+'no_left_mfa'          => ['enabled' => true, 'configurable' => false],
+'many_failed_mfa'      => ['enabled' => true, 'configurable' => false],
+'new_backup_codes'     => ['enabled' => true, 'configurable' => false],
 ```
 
 - `configurable: true` — 用户可在偏好设置中关闭该类通知
-- `configurable: false` — 安全关键通知，不允许用户关闭
+- `configurable: false` — 该类通知在配置中标记为不可由用户关闭
 
 ### 5.4 OwnerNotifiable 虚拟对象
 
@@ -404,7 +423,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
        │
        └─ 已知用户 → event(new UserFailedLoginAttempt($user))
                     │
- 4                  │  审计日志（控制器直写，先于事件）
+ 4                  │  审计日志（控制器直写）
                     │  Log::channel('audit')->warning('Login failed...')
                     │  app/Http/Controllers/Auth/LoginController.php#L141
                     │
@@ -433,7 +452,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
        │  ├── 清理 >6个月 的旧条目
        │  └── Preferences::setForUser() 保存偏好
        │       │
- 4          └── 新IP && 用户开启通知通知？
+ 4          └── 新IP && 用户开启通知？
                   event(new UserLoggedInFromNewIpAddress($user))
                        │
  5                  NotifiesUserAboutNewIpAddress [ShouldQueue]
@@ -444,7 +463,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
                        └── Preferences::setForUser() 保存偏好
 ```
 
-### 场景C：生成访问令牌（Passport 内部事件 + 同步监听器）
+### 场景C：生成访问令牌（Passport 内部事件）
 
 ```
 步骤  组件                                   操作
@@ -457,7 +476,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
        │  → INSERT INTO oauth_access_tokens
        │  → event(new AccessTokenCreated($userId, $tokenId, $clientId))
        │
- 3    NotifiesUserAboutNewAccessToken（★ 同步！无 ShouldQueue）
+ 3    NotifiesUserAboutNewAccessToken（未实现 ShouldQueue）
        app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php#L32-L43
        │  → $user = $repository->find((int) $event->userId)
        │  → NotificationSender::send($user, new NewAccessToken())
@@ -502,9 +521,9 @@ app/Notifications/Notifiables/OwnerNotifiable.php
 
 | 文件 | 作用 |
 |------|------|
-| `bootstrap/app.php` | 应用实例创建，**withEvents(discover:) 配置事件发现目录** |
+| `bootstrap/app.php` | 应用实例创建，`withEvents(discover:)` 配置事件发现目录 |
 | `bootstrap/providers.php` | 服务提供者注册（EventServiceProvider 已注释） |
-| `app/Providers/EventServiceProvider.php` | 事件服务提供者（$listen 全注释，实际不生效） |
+| `app/Providers/EventServiceProvider.php` | 事件服务提供者（$listen 全注释） |
 
 ### 事件定义
 
@@ -517,17 +536,17 @@ app/Notifications/Notifiables/OwnerNotifiable.php
 
 | 目录 | 内容 |
 |------|------|
-| `app/Listeners/Security/User/` | 用户安全监听器 13 个 |
-| `app/Listeners/Security/System/` | 系统安全监听器 6 个 |
+| `app/Listeners/Security/User/` | 用户安全监听器 14 个 |
+| `app/Listeners/Security/System/` | 系统安全监听器 5 个 |
 
 ### 持久化
 
 | 文件 | 作用 |
 |------|------|
-| `config/logging.php` | 审计日志通道配置（audit_daily/audit_stdout 等） |
+| `config/logging.php` | 审计日志通道配置 |
 | `app/Support/Logging/AuditLogger.php` | 审计日志 tap 处理器，注入 AuditProcessor |
 | `app/Support/Logging/AuditProcessor.php` | 自动注入 IP/用户/URL 上下文 |
-| `app/Models/AuditLogEntry.php` | 数据库审计表模型（仅交易变更用） |
+| `app/Models/AuditLogEntry.php` | 数据库审计表模型（交易变更用） |
 | `app/Repositories/AuditLogEntry/ALERepository.php` | 审计仓储 |
 | `database/migrations/2022_10_01_210238_audit_log_entries.php` | 审计表迁移 |
 
@@ -560,23 +579,26 @@ app/Notifications/Notifiables/OwnerNotifiable.php
 
 ---
 
-## 八、设计要点总结
+## 八、代码事实总结
 
-### 8.1 本次修正的四处关键信息
+### 8.1 核实的关键事实
 
-| 原问题 | 修正后实际情况 | 复核依据 |
-|--------|--------------|---------|
-| 事件发现入口在 EventServiceProvider | 真正入口在 `bootstrap/app.php` 的 `withEvents(discover:)`，EventServiceProvider 已被注释 | `bootstrap/providers.php` 第50行 + `bootstrap/app.php` 第166-168行 |
-| 绑定通过 `#[Subscribe]` 属性 | 绑定通过 `handle()` 方法参数类型声明完成 | 每个监听器的 `handle(EventClass $event)` 参数 |
-| 所有安全监听器都异步 | `NotifiesUserAboutNewAccessToken` 未实现 `ShouldQueue`，始终同步执行 | `app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php` 第32行 |
-| 链接使用本机绝对路径 | 使用仓库相对路径 | 本文档所有链接 |
-| 审计日志通过监听器写入 | 审计日志由控制器**直写** `Log::channel('audit')`，先于事件触发 | LoginController/TwoFactorController/MfaController 中的 `Log::channel('audit')` 调用 |
+| 核查项 | 代码事实 | 复核依据 |
+|--------|---------|---------|
+| 事件发现入口 | `bootstrap/app.php` 的 `withEvents(discover:)`，EventServiceProvider 已被注释 | `bootstrap/providers.php` 第50行 + `bootstrap/app.php` 第166-168行 |
+| 监听器绑定依据 | `handle()` 方法参数类型声明 | 每个监听器的 `handle(EventClass $event)` 参数 |
+| 令牌创建审计日志 | 无 `Log::channel('audit')` 调用 | `app/Http/Controllers/Profile/OAuthController.php` 第187-194行 |
+| 审计日志调用者 | 分布于 Controllers、Rules、Repositories、Http/Requests 四类文件 | 全局 `Log::channel('audit')` 搜索结果 |
+| 用户 Pushover 开关条件 | 检查 `notifications.channels.slack.enabled` 配置，而非 `pushover.enabled` | `app/Notifications/ReturnsAvailableChannels.php` 第116行 |
+| 安全监听器数量 | 总计 19 个（User 目录14个 + System 目录5个） | Glob 扫描结果 |
+| NotifiesUserAboutNewAccessToken | 未实现 `ShouldQueue` 接口 | `app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php` 第32行 |
+| 默认队列驱动 | `sync`（同步），所有监听器同步执行 | `config/queue.php` 第37行 |
 
-### 8.2 架构设计特征
+### 8.2 代码实现特征
 
-1. **启动配置即发现配置**：`bootstrap/app.php` 中 `withEvents(discover:)` 一行即完成事件绑定，`EventServiceProvider` 实际不生效
-2. **审计与通知职责分离**：审计日志（文件）由控制器直写，通知分发由监听器触发，互不依赖
-3. **默认同步执行**：队列默认 `sync` 驱动，所有 `ShouldQueue` 监听器实际同步执行，需配置 `database`/`redis` 驱动才真正异步
-4. **令牌通知同步保证**：`NotifiesUserAboutNewAccessToken` 刻意不实现 `ShouldQueue`，确保令牌创建时通知立即发出
-5. **安全通知不可关闭**：MFA 相关通知 `configurable: false`，用户无法在 UI 中关闭
-6. **审计上下文实时捕获**：`AuditProcessor` 在日志写入前通过 `auth()`/`request()` 实时获取当前请求状态
+1. 事件绑定由 `bootstrap/app.php` 的 `withEvents(discover:)` 配置完成，`EventServiceProvider` 未注册
+2. 审计日志写入调用分布于四类代码位置（Controllers、Rules、Repositories、Http/Requests），与事件监听器无依赖关系
+3. 令牌创建路径无直接审计日志写入，仅通过 `AccessTokenCreated` 事件触发通知
+4. 19个安全监听器中18个实现 `ShouldQueue`，`NotifiesUserAboutNewAccessToken` 未实现
+5. 默认 `QUEUE_CONNECTION=sync`，所有监听器同步执行
+6. 用户 Pushover 渠道的开关条件检查的是 Slack 配置项
