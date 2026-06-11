@@ -1,6 +1,6 @@
 # 月度报表与周期统计聚合流程详解
 
-本文档梳理 Firefly III 中月度报表与周期统计从原始交易数据到最终图表展示的完整数据流转过程，分为**统计区间切分**、**聚合查询**、**图表数据装配**三大阶段。
+本文档梳理 Firefly III 中月度报表与周期统计从原始交易数据到最终图表展示的完整数据流转过程，分为**统计区间切分**、**聚合查询**、**图表数据装配**三大阶段，并在末尾独立分析周期统计缓存的失效机制。
 
 ---
 
@@ -108,9 +108,7 @@ getAccountPeriodOverview()
 - `no_budget_spent` — 无预算的支出
 - `all_withdrawal` / `all_deposit` / `all_transfer` — 全局交易统计
 
-### 3.2 周期统计缓存的区间边界处理
-
-**查询时的边界比较**：app/Support/Http/Controllers/PeriodOverview.php
+### 3.2 周期统计缓存的区间边界处理（查询/保存侧）
 
 周期统计缓存的边界匹配使用**精确匹配 + 范围查询**双模式：
 
@@ -119,19 +117,15 @@ getAccountPeriodOverview()
    - `allInRangeForPrefix()`：同上，再加前缀 LIKE
    - 一次把范围内所有周期的统计全部查出，放内存中
 
-2. **单周期命中（精确模式）**：
+2. **单周期命中（精确模式）**：app/Support/Http/Controllers/PeriodOverview.php
    - `filterStatistics()`：`$statistic->start->isSameSecond($start) && $statistic->end->isSameSecond($end)`
    - `filterPrefixedStatistics()`：`$statistic->start->eq($start) && $statistic->end->eq($end)`
    - 必须秒级完全一致，因为周期块的起止时间都是规整的（月初/月末）
 
-3. **失效时的边界删除**：
-   - `deleteStatisticsForModel($model, $date)`：`WHERE start <= $date AND end >= $date`（跨日期的周期都会被删）
-   - `deleteStatisticsForType()`：对每个 date 都用 `start <= date AND end >= date` 的 OR 组合
-
-**保存时的边界规整**：app/Repositories/PeriodStatistic/PeriodStatisticRepository.php
-- `saveStatistic()` / `savePrefixedStatistic()` 直接把周期块的 start/end 原样存入
-- 同时记录 `start_tz` / `end_tz`（即 `$start->format('e')`）
-- 周期块本身已由 Navigation 规整，所以边界天然一致
+3. **保存时的边界规整**：app/Repositories/PeriodStatistic/PeriodStatisticRepository.php
+   - `saveStatistic()` / `savePrefixedStatistic()` 直接把周期块的 start/end 原样存入
+   - 同时记录 `start_tz` / `end_tz`（即 `$start->format('e')`）
+   - 周期块本身已由 Navigation 规整，所以边界天然一致
 
 ### 3.3 核心组件
 
@@ -144,8 +138,9 @@ app/Repositories/PeriodStatistic/PeriodStatisticRepository.php
 - `findPeriodStatistic($model, $start, $end, $type)` — 精确查找单条
 - `saveStatistic(...)` — 保存模型关联统计
 - `savePrefixedStatistic(...)` — 保存前缀类型统计
-- `deleteStatisticsForModel(...)` — 按模型+日期失效统计
-- `deleteStatisticsForPrefix(...)` — 按前缀+日期失效
+- `deleteStatisticsForModel(...)` — 按模型+单个日期失效统计
+- `deleteStatisticsForType(...)` — 按模型类型+对象集合+日期集合批量失效
+- `deleteStatisticsForPrefix(...)` — 按前缀+日期集合批量失效
 
 #### PeriodOverview Trait
 app/Support/Http/Controllers/PeriodOverview.php
@@ -496,13 +491,243 @@ JSON → 前端 Chart.js 渲染
 
 ---
 
-## 六、关键设计要点
+## 六、周期统计缓存失效机制详解
 
-### 6.1 两层缓存策略
+### 6.1 触发源：三类事件分别挂载三个监听器
+
+交易组（TransactionGroup）的新增、更新、删除都会触发周期统计缓存失效。三个监听器都通过 `SupportsGroupProcessingTrait` 复用同一套失效逻辑。
+
+| 事件类型 | 事件类 | 监听器类 | 调用 removePeriodStatistics 的时机 |
+|---------|--------|----------|----------------------------------|
+| 新增 | CreatedSingleTransactionGroup | ProcessesNewTransactionGroup | 在规则引擎处理之后、标记完成之前 |
+| 更新 | UpdatedSingleTransactionGroup | ProcessesUpdatedTransactionGroup | 在 unifyAccounts 和规则处理之后 |
+| 删除 | DestroyedSingleTransactionGroup | ProcessesDestroyedTransactionGroup | 在 webhook 触发之后、运行余额重算之前 |
+
+三个监听器都使用 `SupportsGroupProcessingTrait::removePeriodStatistics()` 做实际的缓存删除。
+
+**监听器的位置**：app/Listeners/Model/TransactionGroup/ 目录下
+- ProcessesNewTransactionGroup.php
+- ProcessesUpdatedTransactionGroup.php
+- ProcessesDestroyedTransactionGroup.php
+- SupportsGroupProcessingTrait.php（共用逻辑）
+
+### 6.2 失效入口：removePeriodStatistics()
+
+**位置**：app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php #L93-L119
+
+每次失效会一次性删除**四个模型维度**加**四个前缀维度**的统计：
+
+```php
+$dates = $this->collectDatesFromJournals($objects->transactionJournals);
+
+// 模型维度（4类）：
+$repository->deleteStatisticsForType(Account::class,  $objects->accounts,     $dates);
+$repository->deleteStatisticsForType(Budget::class,   $objects->budgets,      $dates);
+$repository->deleteStatisticsForType(Category::class, $objects->categories,   $dates);
+$repository->deleteStatisticsForType(Tag::class,      $objects->tags,         $dates);
+
+// 前缀维度（4类）：
+$repository->deleteStatisticsForPrefix('all_',        $dates);   // 全局交易统计
+$repository->deleteStatisticsForPrefix('no_budget',   $dates);   // 无预算统计
+$repository->deleteStatisticsForPrefix('no_category', $dates);   // 无分类统计
+$repository->deleteStatisticsForPrefix('no_tag',      $dates);   // 无标签统计
+```
+
+也就是说，一笔交易变更后，所有相关维度的周期统计都会被清掉：
+- 涉及的账户、分类、预算、标签各自的周期统计
+- 全局（all_）、无分类、无预算、无标签的周期统计
+
+### 6.3 日期集合的收集：collectDatesFromJournals()
+
+**位置**：app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php #L121-L129
+
+```php
+private function collectDatesFromJournals(Collection $journals): Collection
+{
+    $collection = $journals->pluck('date');
+    if (0 === count($collection)) {
+        $collection->push(now(config('app.timezone')));
+    }
+    return $collection;
+}
+```
+
+- 直接从 transaction_journals 表的 `date` 字段提取
+- 如果 journals 为空（理论上不该发生），回退为当前时间
+
+**更新时日期集合包含新旧两套**：
+app/Api/V1/Controllers/Models/Transaction/UpdateController.php #L80-L83
+```php
+$objects = TransactionGroupEventObjects::collectFromTransactionGroup($transactionGroup); // 旧的
+$transactionGroup = $this->groupRepository->update($transactionGroup, $data);          // 更新
+$objects->appendFromTransactionGroup($transactionGroup);                               // 追加上新的
+```
+
+所以更新事件的 dates 是**旧日期 + 新日期**的并集。哪怕只改了日期字段，两个日期都会进入删除条件。
+
+### 6.4 对象集合的收集：TransactionGroupEventObjects
+
+**位置**：app/Events/Model/TransactionGroup/TransactionGroupEventObjects.php
+
+通过 `collectFromTransactionGroup()` 收集，再通过 `appendFromTransactionGroup()` 追加，所有对象都 `unique('id')` 去重。
+
+收集规则：
+- accounts：遍历所有 transaction → account（即每个拆分的两方账户）
+- budgets：journal->budgets（一对多）
+- categories：journal->categories（一对多）
+- tags：journal->tags（多对多，通过中间表）
+- transactionJournals：组内所有 journals
+- transactionGroups：组本身
+
+更新时同样收集**旧对象 + 新对象**的并集。
+
+### 6.5 多日期删除条件的 SQL 逻辑：AND 叠加（注意：不是 OR）
+
+这是缓存失效机制中最容易理解错的地方。
+
+#### 模型维度：deleteStatisticsForType()
+
+**位置**：app/Repositories/PeriodStatistic/PeriodStatisticRepository.php #L121-L140
+
+```php
+$count = PeriodStatistic::where('primary_statable_type', $class)
+    ->whereIn('primary_statable_id', $objects->pluck('id')->toArray())
+    ->where(function (Builder $q) use ($dates): void {
+        foreach ($dates as $date) {
+            $q->where(function (Builder $q1) use ($date): void {
+                $q1->where('start', '<=', $date)->where('end', '>=', $date);
+            });
+        }
+    })
+    ->delete()
+;
+```
+
+生成的 SQL 等价于：
+```sql
+WHERE primary_statable_type = ?
+  AND primary_statable_id IN (?, ?, ...)
+  AND (
+    (start <= date1 AND end >= date1)
+    AND
+    (start <= date2 AND end >= date2)
+    AND
+    (start <= dateN AND end >= dateN)
+  )
+```
+
+注意：`foreach` 里面调用的是 `$q->where(...)`，在 Laravel 查询构造器中，同一级的多个 `where()` 默认是 **AND** 连接。
+
+**含义：一条统计记录的 start..end 区间必须同时包含所有日期，才会被删除。**
+
+#### 前缀维度：deleteStatisticsForPrefix()
+
+**位置**：app/Repositories/PeriodStatistic/PeriodStatisticRepository.php #L99-L119
+
+逻辑完全一样，只是把模型条件换成了 `type LIKE 'prefix%'`：
+
+```sql
+WHERE type LIKE 'prefix%'
+  AND user_group_id = ?
+  AND (
+    (start <= date1 AND end >= date1)
+    AND (start <= date2 AND end >= date2)
+    AND ...
+  )
+```
+
+#### 单日期版本：deleteStatisticsForModel()
+
+**位置**：app/Repositories/PeriodStatistic/PeriodStatisticRepository.php #L93-L96
+
+单日期版本就简单了：
+```php
+$model->primaryPeriodStatistics()->where('start', '<=', $date)->where('end', '>=', $date)->delete();
+```
+删除所有跨该日期的周期统计。
+
+### 6.6 AND 叠加带来的失效效应
+
+由于多日期条件是 AND 叠加，实际失效范围会**远小于直觉预期**。以下举例说明（假设主币种、月度视图）：
+
+**场景 1：新增一笔交易，日期 1月15日**
+- dates = [1月15日]
+- 1月份统计：start<=1/15 AND end>=1/15 → 真 → 删除 ✓
+- 1季度统计：同上 → 真 → 删除 ✓
+- 1年度统计：同上 → 真 → 删除 ✓
+- 结论：单日期时 AND 和 OR 没有区别，所有跨该日期的周期都会被删
+
+**场景 2：更新一笔交易，日期从 1月15日 改为 2月15日**
+- dates = [1月15日, 2月15日]（新旧两个日期的并集）
+- 1月份统计（1/1 ~ 1/31）：
+  - start<=1/15 AND end>=1/15 → 真
+  - start<=2/15 AND end>=2/15 → 假（end=1/31 < 2/15）
+  - AND → 假 → **不删** ✗
+- 2月份统计（2/1 ~ 2/29）：
+  - start<=1/15 → 假（start=2/1 > 1/15）
+  - AND → 假 → **不删** ✗
+- 1季度统计（1/1 ~ 3/31）：
+  - 两个日期都在区间内 → 真 → 删除 ✓
+- 1年度统计：同上 → 删除 ✓
+
+结论：只有**同时横跨所有日期**的更大粒度周期才会被删除。本例中只有季度和年度统计会被清掉，月度统计保持不动。
+
+**场景 3：批量导入 10 笔交易，分散在 1~10 月各一笔**
+- dates = [1月1日, 2月1日, 3月1日, ..., 10月1日]
+- 任何单个月度统计：都只包含一个月的日期，不可能同时包含 10 个不同月份的日期
+- 季度统计：最多跨 3 个月，不可能覆盖 10 个月的日期
+- 年度统计：同时包含所有日期 → 只有年度统计会被删除
+- 结论：只有年度粒度的统计会失效，月/季粒度全部保留旧数据
+
+### 6.7 跨周期交易组对懒重算的影响
+
+由于 AND 条件的存在，当交易变更涉及多个不同周期的日期时，**只有最大粒度的周期统计会被正确失效和重算**，更细粒度的周期统计会残留旧数据。
+
+具体表现：
+
+| 粒度 | 是否被删除 | 下次查看时是否懒重算 | 数据正确性 |
+|------|-----------|---------------------|-----------|
+| 日 | 否 | 否（缓存已存在，即使数据旧了也会命中） | 不准确 |
+| 周 | 否 | 否 | 不准确 |
+| 月 | 否（跨月时） | 否 | 不准确 |
+| 季 | 可能（取决于日期跨度） | 是 | 若被删则准确 |
+| 年 | 是 | 是 | 准确 |
+
+**数据不一致的传导路径**：
+1. 用户修改一笔交易的日期（从 1月 改到 2月）
+2. 只有季度/年度统计被删除
+3. 用户查看账户详情页的月度周期列表
+4. PeriodOverview 从 period_statistics 表查出 1月和 2月的统计——都是旧数据
+5. 1月统计还包含这笔交易（实际已移走），2月统计不包含这笔交易（实际已移入）
+6. 但季度和年度统计如果被重新计算过，是准确的
+7. 只有当用户触发某个月的「强制重算」（比如该月统计因某种原因被删除了），那个月的数据才会变正确
+
+**注意**：以上是基于代码逻辑的分析。如果这是有意设计的（比如为了减少删除量、用较大粒度的统计兜底），那是权衡的结果；如果是无意的，那可能是一个 bug——直觉上多日期条件应该用 `orWhere` 才对，即只要有一个日期落在周期内就删除该周期的统计。
+
+### 6.8 两层缓存的独立性
+
+周期统计缓存失效**只影响 period_statistics 数据库表**，不影响 CacheProperties 应用级缓存。两者是独立的：
+
+1. **交易变更 → Listener → 删除 period_statistics 记录**
+   - 只删数据库里的预计算统计
+   - 下次 PeriodOverview 查询时，因查不到记录而触发懒重算
+
+2. **CacheProperties 缓存（报表 HTML / 图表 JSON）**
+   - 有自己的 key 和过期时间
+   - 交易变更**不会**主动清这层缓存
+   - 依赖缓存过期自动失效，或者依赖页面参数变化导致 key 变化
+
+所以报表页面（Report\*Controller 的 HTML 输出）的缓存不会因为交易变更而立即刷新，只有等缓存过期后才会重新聚合。
+
+---
+
+## 七、关键设计要点汇总
+
+### 7.1 两层缓存策略
 
 1. **PeriodStatistic 表**（数据库级）
    - 按模型/类型/币种/周期存预计算统计
-   - 交易变更时 Listener 删除「日期落在 start..end 内」的所有相关统计
+   - 交易变更时 Listener 删除「跨所有日期」的周期统计（多日期 AND 条件）
    - 下次查询懒重算并写回
    - 空结果也存一条（count=0, amount=0），避免反复重查
 
@@ -510,24 +735,26 @@ JSON → 前端 Chart.js 渲染
    - 报表 HTML、图表 JSON 用 Laravel Cache 存
    - key = start + end + 标识 + accountIds + convertToPrimary
    - 命中率高，大幅提升页面加载速度
-   - 两类缓存独立，互不影响
+   - 交易变更不主动清这层缓存，依赖过期
 
-### 6.2 周期边界处理的一致性
+两类缓存独立，互不影响。
+
+### 7.2 周期边界处理的一致性
 
 - **生成周期块**：Navigation::startOfPeriod/endOfPeriod 统一规整，秒和毫秒都清零
 - **存储**：start/end 原样入库，同时存 start_tz/end_tz
 - **读取还原**：SeparateTimezoneCaster 用 start_tz 解析后转应用时区，保证比较一致性
 - **查询匹配**：批量用 `start >= X AND end <= Y`，单条用 `isSameSecond()` 精确比对
-- **失效**：按交易日期 `start <= date AND end >= date` 删所有跨该日的周期
+- **失效删除**：单日期用 `start <= date AND end >= date`，多日期用 AND 叠加
 
-### 6.3 空周期补零
+### 7.3 空周期补零
 
 - 不是从数据反推有哪些周期，而是**按 Navigation::addPeriod() 步进构造完整时间轴**
 - 步长由 start/end 总跨度自适应：<1月按天，1月~1年按月，≥1年按年
 - 年度图最末周期还会扩展为完整 endOfPeriod(end, '1Y')，避免最后一个柱被截断
 - 确保 Chart.js 的 x 轴标签完整连续，不会因为某月无数据而缺柱
 
-### 6.4 多币种处理的两条等价路径
+### 7.4 多币种处理的两条等价路径
 
 路径 A：PeriodOverview 系列（周期概览）→ `groupByCurrency()`
 路径 B：图表控制器系列 → `resolveJournalAmountAndCurrency()`
@@ -544,7 +771,7 @@ else → 用原 amount + 原币种元信息
 - 所有金额计算用 bc* 系列函数，字符串高精度，避免浮点误差
 - 聚合后每个币种独立一条记录，图表中不同币种可能作为独立 dataset 或独立 y 轴
 
-### 6.5 月度报表的前后端分工
+### 7.5 月度报表的前后端分工
 
 - 后端 ReportController 只输出页面骨架（含各区域的 URL）
 - 每个表格区域对应一个独立的异步端点（Report\*Controller）
