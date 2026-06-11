@@ -148,22 +148,33 @@ public function storePersonalAccessToken(Request $request): JsonResponse
 }
 ```
 
-### 3.2 审计日志的调用者分布于四类文件
+### 3.2 审计日志调用者的完整分类（共100个文件）
 
-`Log::channel('audit')` 的调用不限于控制器，实际分布如下：
+全局搜索结果显示，`Log::channel('audit')` 调用分布在以下**七类**代码位置：
 
-| 调用位置类别 | 示例文件 | 典型用途 |
-|------------|---------|---------|
-| **Controllers** | `app/Http/Controllers/Auth/LoginController.php` | 登录/登出/MFA 等安全操作 |
-| **Controllers** | `app/Http/Controllers/Profile/MfaController.php` | MFA 启用/禁用/生成备份码 |
-| **Controllers** | `app/Http/Controllers/Admin/*` | 管理员操作（货币/链接/配置等）|
-| **Rules** | `app/Rules/IsValidAmount.php` | 金额验证规则执行 |
-| **Rules** | `app/Rules/Admin/IsValidSlackUrl.php` | Slack URL 验证 |
-| **Repositories** | `app/Repositories/Tag/TagRepository.php` | `destroyAll()` 批量删除操作 |
-| **Repositories** | `app/Repositories/Budget/BudgetRepository.php` | `destroyAll()` 批量删除操作 |
-| **Http/Requests** | `app/Http/Requests/*FormRequest.php` | 表单验证失败记录 |
+| 类别 | 目录路径 | 文件数 | 典型文件 | 典型用途 |
+|------|---------|--------|---------|---------|
+| **Web表单请求** | `app/Http/Requests/` | 41 | `*FormRequest.php`、`*StoreRequest.php`、`*UpdateRequest.php` | `withValidator()` 钩子中记录 Web 表单验证错误详情 |
+| **API 请求** | `app/Api/V1/Requests/` | 17 | `Models/*/StoreRequest.php`、`UpdateRequest.php` | 记录 API V1 端点的表单验证错误 |
+| **HTTP 控制器** | `app/Http/Controllers/` | ~29 | Auth 下 LoginController/TwoFactorController<br>Profile 下 MfaController<br>Admin、Account、Bill、Budget、Category 等目录下各类 CRUD 控制器<br>Webhooks、TransactionCurrency、Tag、Recurring、PiggyBank、Home 等控制器 | 安全操作日志（登录/登出/MFA）、<br>CRUD 操作记录、权限违规告警、Demo 用户操作拦截、访问页面记录 |
+| **验证规则** | `app/Rules/` | 6 | `IsValidAmount.php`（3个变种）<br>`Admin/IsValidSlackUrl.php` 等（3个） | 自定义验证规则执行过程中记录金额/URL 等校验分支 |
+| **仓储层** | `app/Repositories/` | 9 | Tag、Bill、Budget、Category、PiggyBank、Recurring、RuleGroup 等 Repository | `destroyAll()` 批量删除操作记录 |
+| **Console 命令** | `app/Console/Commands/` | 1 | `System/ForcesMigrations.php` | 系统命令级别的迁移操作记录 |
+| **工厂类** | `app/Factory/` | 1 | `AccountFactory.php` | 数据工厂生成记录 |
+
+**合计**：100 个文件（数据来源：`app/` 目录下 `Log::channel('audit')` 全局搜索结果）
 
 **调用时机说明**：安全相关操作的审计日志调用通常发生在 `event()` 触发**之前**（或同一方法内的邻近位置），与事件监听器无依赖关系。
+
+以下是各类别的详细文件列表（按目录分组）：
+
+- **app/Http/Requests/**（41个）：`TriggerRecurrenceRequest.php`, `UserFormRequest.php`, `UserRegistrationRequest.php`, `TestRuleFormRequest.php`, `TokenFormRequest.php`, `RuleGroupFormRequest.php`, `SelectTransactionsRequest.php`, `TagFormRequest.php`, `ReportFormRequest.php`, `RuleFormRequest.php`, `ProfileFormRequest.php`, `ReconciliationStoreRequest.php`, `RecurrenceFormRequest.php`, `PiggyBankUpdateRequest.php`, `PiggyBankStoreRequest.php`, `ObjectGroupFormRequest.php`, `CategoryFormRequest.php`, `ConfigurationRequest.php`, `CurrencyFormRequest.php`, `DeleteAccountFormRequest.php`, `EmailFormRequest.php`, `ExistingTokenFormRequest.php`, `InviteUserFormRequest.php`, `JournalLinkRequest.php`, `LinkTypeFormRequest.php`, `MassDeleteJournalRequest.php`, `MassEditJournalRequest.php`, `NewUserFormRequest.php`, `BillUpdateRequest.php`, `BudgetFormStoreRequest.php`, `BudgetFormUpdateRequest.php`, `BudgetIncomeRequest.php`, `BulkEditJournalRequest.php`, `BillStoreRequest.php`, `AttachmentFormRequest.php`, `AccountFormRequest.php` 等
+- **app/Api/V1/Requests/**（17个）：`System/UserUpdateRequest.php`，以及 `Models/` 目录下 Account、AvailableBudget、Bill、Budget、BudgetLimit、PiggyBank、Recurrence、Rule、Transaction、TransactionLink 等实体的 `StoreRequest.php` / `UpdateRequest.php`
+- **app/Http/Controllers/**（~29个）：Auth 下的 LoginController、TwoFactorController；Profile 下的 MfaController；Admin 下的 LinkController、NotificationController、ConfigurationController、HomeController；Account、Bill、Budget、Category、PiggyBank、Recurring、Tag 等目录下的 CreateController、EditController；以及 TransactionCurrency 下的三个控制器、Webhooks 下的四个控制器、HomeController
+- **app/Rules/**（6个）：`IsValidZeroOrMoreAmount.php`、`IsValidPositiveAmount.php`、`IsValidAmount.php`、`Admin/IsValidSlackUrl.php`、`Admin/IsValidSlackOrDiscordUrl.php`、`Admin/IsValidDiscordUrl.php`
+- **app/Repositories/**（9个）：`Tag/TagRepository.php`、`RuleGroup/RuleGroupRepository.php`、`Recurring/RecurringRepository.php`、`PiggyBank/PiggyBankRepository.php`、`Category/CategoryRepository.php`、`Budget/BudgetRepository.php`、`Budget/BudgetLimitRepository.php`、`Bill/BillRepository.php`、`Budget/AvailableBudgetRepository.php`
+- **app/Console/Commands/**（1个）：`System/ForcesMigrations.php`
+- **app/Factory/**（1个）：`AccountFactory.php`
 
 ### 3.3 AuditProcessor 上下文注入时机
 
@@ -588,7 +599,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
 | 事件发现入口 | `bootstrap/app.php` 的 `withEvents(discover:)`，EventServiceProvider 已被注释 | `bootstrap/providers.php` 第50行 + `bootstrap/app.php` 第166-168行 |
 | 监听器绑定依据 | `handle()` 方法参数类型声明 | 每个监听器的 `handle(EventClass $event)` 参数 |
 | 令牌创建审计日志 | 无 `Log::channel('audit')` 调用 | `app/Http/Controllers/Profile/OAuthController.php` 第187-194行 |
-| 审计日志调用者 | 分布于 Controllers、Rules、Repositories、Http/Requests 四类文件 | 全局 `Log::channel('audit')` 搜索结果 |
+| 审计日志调用者 | 共100个文件，分布于七类代码位置：Web表单请求(41个)、API请求(17个)、HTTP控制器(~29个)、验证规则(6个)、仓储层(9个)、Console命令(1个)、Factory(1个) | app/ 目录下 `Log::channel('audit')` 全局搜索结果 |
 | 用户 Pushover 开关条件 | 检查 `notifications.channels.slack.enabled` 配置，而非 `pushover.enabled` | `app/Notifications/ReturnsAvailableChannels.php` 第116行 |
 | 安全监听器数量 | 总计 19 个（User 目录14个 + System 目录5个） | Glob 扫描结果 |
 | NotifiesUserAboutNewAccessToken | 未实现 `ShouldQueue` 接口 | `app/Listeners/Security/User/NotifiesUserAboutNewAccessToken.php` 第32行 |
@@ -597,7 +608,7 @@ app/Notifications/Notifiables/OwnerNotifiable.php
 ### 8.2 代码实现特征
 
 1. 事件绑定由 `bootstrap/app.php` 的 `withEvents(discover:)` 配置完成，`EventServiceProvider` 未注册
-2. 审计日志写入调用分布于四类代码位置（Controllers、Rules、Repositories、Http/Requests），与事件监听器无依赖关系
+2. 审计日志写入调用共100个文件，分布于七类代码位置（Web表单请求、API请求、HTTP控制器、验证规则、仓储层、Console命令、Factory），与事件监听器无依赖关系
 3. 令牌创建路径无直接审计日志写入，仅通过 `AccessTokenCreated` 事件触发通知
 4. 19个安全监听器中18个实现 `ShouldQueue`，`NotifiesUserAboutNewAccessToken` 未实现
 5. 默认 `QUEUE_CONNECTION=sync`，所有监听器同步执行
