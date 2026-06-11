@@ -24,7 +24,7 @@ $table->boolean('uploaded')->default(1);
 $table->foreign('user_id')->references('id')->on('users')->onDelete('cascade');
 ```
 
-核心设计：使用 Laravel 的 **Polymorphic Morph** 模式，`attachable_id` + `attachable_type` 两个字段组合指向上级实体。
+核心设计：使用 Laravel 的 **Polymorphic Morph** 模式，`attachable_id` + `attachable_type` 两个字段组合指向上级实体。注意 `attachable_type` 存储的是模型 FQCN（如 `FireflyIII\Models\TransactionJournal`），不是短名。
 
 ### 1.2 合法的 attachable_type 列表
 
@@ -61,8 +61,6 @@ public function attachable(): MorphTo
 
 ### 2.2 各实体模型侧（正向）
 
-所有拥有附件能力的模型都声明了 `attachments(): MorphMany`，示例如下：
-
 | 模型 | 代码位置 | 关系声明 |
 |---|---|---|
 | TransactionJournal | [TransactionJournal::attachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Models/TransactionJournal.php#L117-L120) | `$this->morphMany(Attachment::class, 'attachable')` |
@@ -74,65 +72,309 @@ public function attachable(): MorphTo
 | Tag | [Tag::attachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Models/Tag.php#L80) | `$this->morphMany(Attachment::class, 'attachable')` |
 | Recurrence | [Recurrence::attachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Models/Recurrence.php#L100) | `$this->morphMany(Attachment::class, 'attachable')` |
 
-> **注意**：`Transaction` 模型 **没有** 声明 `attachments()` 关系方法，尽管它是合法的 `attachable_type`。
+**关键事实**：`Transaction` 模型 **没有** 声明 `attachments()` 关系方法，尽管它是合法的 `attachable_type`。`TransactionGroup` 也没有声明。
 
-## 3. 关键不一致点：Transaction vs TransactionJournal
+## 3. 三层交易模型与附件归属
 
-### 3.1 三层交易模型结构
+### 3.1 模型层级
 
 ```
-TransactionGroup (交易组)
-  └── TransactionJournal (交易日志，一种交易类型)
-        └── Transaction (交易记录，一进一出的两条)
+TransactionGroup (交易组，可包含多笔拆分交易)
+  └── TransactionJournal (交易日志，一笔交易，含类型信息)
+        └── Transaction (交易记录，一借一贷两条)
 ```
 
 - 一个 **TransactionGroup** 可包含多个 **TransactionJournal**（拆分交易场景）
 - 一个 **TransactionJournal** 恰好包含两个 **Transaction**（一借一贷）
+- `TransactionGroup` 和 `Transaction` 都**没有** `attachments()` 关系
 
-### 3.2 附件归挂在 Journal 而非 Transaction
+### 3.2 Transaction 与 TransactionJournal 的实际落库关系
 
-**数据库中的实际归属**：在 `AttachmentFactory::create` 中存在关键逻辑——
+**结论先行**：在所有入口下，附件的 `attachable_type` 最终都存储为 `TransactionJournal`，不会存储为 `Transaction`。但这一结论的原因因入口而异，需要区分分析：
 
-[AttachmentFactory::create](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Factory/AttachmentFactory.php#L44-L84)：
+#### 入口 A：Web UI 交易创建（v1 / v2）
+
+前端始终硬编码传入 `attachable_type: 'TransactionJournal'`，后端 `AttachmentFactory::create` 不会触发 Transaction→Journal 转换，直接写入 `TransactionJournal`。
+
+证据：
+- [v1 CreateTransaction.vue#L633](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/CreateTransaction.vue#L633)：`attachable_type: 'TransactionJournal'`
+- [v2 process-attachments.js#L31](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/shared/process-attachments.js#L31)：`poster.post(fileData[key].name, 'TransactionJournal', fileData[key].journal)`
+
+#### 入口 B：API 直接创建附件 `POST /api/v1/attachments`
+
+调用链：`StoreController::store` → `AttachmentRepository::store` → `AttachmentFactory::create`
+
+[AttachmentFactory::create](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Factory/AttachmentFactory.php#L44-L84) 中存在 **Transaction→Journal 自动提升逻辑**：
 
 ```php
-public function create(array $data): ?Attachment
-{
-    $model = str_contains((string) $data['attachable_type'], 'FireflyIII')
-        ? $data['attachable_type']
-        : sprintf('FireflyIII\Models\%s', $data['attachable_type']);
+$model = str_contains((string) $data['attachable_type'], 'FireflyIII')
+    ? $data['attachable_type']
+    : sprintf('FireflyIII\Models\%s', $data['attachable_type']);
 
-    // ★ 如果传入 Transaction，自动转换到 TransactionJournal
-    if (Transaction::class === $model) {
-        $transaction = $this->user->transactions()->find((int) $data['attachable_id']);
-        $data['attachable_id'] = $transaction->transaction_journal_id;
-        $model = TransactionJournal::class;
-    }
+if (Transaction::class === $model) {
+    $transaction = $this->user->transactions()->find((int) $data['attachable_id']);
+    $data['attachable_id'] = $transaction->transaction_journal_id;
+    $model = TransactionJournal::class;
+}
 
-    $attachment = Attachment::create([
-        'attachable_type' => $model,  // 最终存储的是 TransactionJournal
-        'attachable_id'   => $data['attachable_id'],
-        // ...
-    ]);
+$attachment = Attachment::create([
+    'attachable_type' => $model,  // 最终存储 TransactionJournal
+    'attachable_id'   => $data['attachable_id'],
+]);
+```
+
+如果 API 用户传入 `attachable_type=Transaction` + `attachable_id=123`，后端会：
+1. 查找 Transaction#123
+2. 取其 `transaction_journal_id`
+3. 将 `attachable_type` 改为 `TransactionJournal::class`，`attachable_id` 改为 journal ID
+4. 写入数据库
+
+**结果**：数据库中**不会出现** `attachable_type = FireflyIII\Models\Transaction` 的记录。
+
+#### 入口 C：Web UI 非交易实体（Account/Bill 等）
+
+调用链：Controller → `AttachmentHelper::saveAttachmentsForModel`
+
+[AttachmentHelper::processFile](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Attachments/AttachmentHelper.php#L263-L310)：
+
+```php
+$attachment = new Attachment();
+$attachment->user()->associate($user);
+$attachment->attachable()->associate($model);  // 直接用 Morph 关联
+$attachment->save();
+```
+
+此路径通过 Eloquent 的 `associate()` 方法设置 `attachable_type` 和 `attachable_id`，取的是模型的 FQCN。由于不会传入 `Transaction` 实例（交易走的是前端 API 路径），因此此处也不会产生 `Transaction` 类型的附件记录。
+
+#### 入口 D：附件更新 `PUT /api/v1/attachments/{id}`
+
+[AttachmentRepository::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Attachment/AttachmentRepository.php#L132-L155)：
+
+```php
+if (array_key_exists('attachable_type', $data) && array_key_exists('attachable_id', $data)) {
+    $attachment->attachable_id   = (int) $data['attachable_id'];
+    $attachment->attachable_type = sprintf('FireflyIII\Models\%s', $data['attachable_type']);
 }
 ```
 
-**结论**：即使 API 传入 `attachable_type = Transaction`，后端也会将其**自动提升**为 `TransactionJournal`。数据库中不会存在 `attachable_type = Transaction` 的附件记录。
+**关键差异**：`AttachmentRepository::update` **没有** AttachmentFactory 中 Transaction→Journal 的自动提升逻辑！如果通过 API 更新附件时传入 `attachable_type=Transaction`，它会被原样存储为 `FireflyIII\Models\Transaction`，**不会**被转换为 TransactionJournal。
 
-### 3.3 查询侧同样只关联 Journal
+这是创建入口与更新入口之间的**本质差异**。
 
-[TransactionGroupRepository::getAttachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L109-L136)：
+#### 落库关系总结
+
+| 入口 | 传入 Transaction 类型时 | 最终落库 attachable_type |
+|---|---|---|
+| API 创建附件 (AttachmentFactory) | 自动提升为 Journal | `TransactionJournal` |
+| Web UI 交易创建/编辑 | 前端硬编码 Journal | `TransactionJournal` |
+| Web UI 非交易实体 | 不涉及 Transaction | 各实体 FQCN |
+| **API 更新附件 (AttachmentRepository)** | **不做转换，原样存储** | **可能为 `Transaction`** |
+
+## 4. 三类交易入口的附件处理
+
+### 4.1 交易创建入口
+
+#### Web UI v1
+
+[CreateTransaction.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/CreateTransaction.vue#L565-L648)
+
+流程：
+1. 前端提交交易数据 → `POST /api/v1/transactions`
+2. 后端返回交易组，包含每个 split 的 `transaction_journal_id`
+3. 前端 `collectAttachmentData()` 将文件与 journal ID 对应（按索引 key 匹配）
+4. 前端异步调用 `POST /api/v1/attachments`，`attachable_type: 'TransactionJournal'`
+5. 再调用 `POST /api/v1/attachments/{id}/upload` 上传文件内容
+
+#### Web UI v2
+
+[edit.js#L125-L190](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/edit.js#L125-L190) 和 [process-attachments.js](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/shared/process-attachments.js#L61-L114)
+
+流程与 v1 相同，但使用 Alpine.js + 模块化 API 客户端（`AttachmentPost`）。
+
+**关键细节**：`processAttachments()` 接收的 `transactions` 数组来自后端 API 响应中的 `group.attributes.transactions`，每个元素都有 `transaction_journal_id`。前端文件输入框 `input[name="attachments[]"]` 与 transactions 数组**按索引 key 一一对应**。
+
+#### API 创建交易
+
+[Transaction\StoreController::store](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Transaction/StoreController.php#L85-L143)
+
+后端只负责创建交易，**不处理附件**。API 用户需单独调用附件 API 创建并上传附件。
+
+### 4.2 交易编辑入口
+
+#### Web UI v1
+
+[EditTransaction.vue#L874-L992](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/EditTransaction.vue#L874-L992)
+
+编辑页的附件上传逻辑与创建页**完全一致**：
+1. 用户在表单中选择新附件文件
+2. 提交交易更新 → `PUT /api/v1/transactions/{id}`
+3. 后端返回更新后的交易组（含 `transaction_journal_id`）
+4. 前端 `collectAttachmentData()` 按索引匹配，调用附件 API 上传
+
+**编辑时只能添加新附件，不能通过交易编辑表单删除已有附件。** 已有附件的删除需通过附件管理页面单独操作。
+
+#### Web UI v2
+
+[edit.js#L157-L167](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/edit.js#L157-L167)：
+
+```javascript
+putter.put(submission, {id: this.groupProperties.id}).then((response) => {
+    const group = response.data.data;
+    this.groupProperties.id = parseInt(group.id);
+    const attachmentCount = processAttachments(this.groupProperties.id, group.attributes.transactions);
+    // ...
+});
+```
+
+与创建逻辑复用同一个 `processAttachments()` 函数，同样硬编码 `TransactionJournal`。
+
+#### Web UI EditController（后端）
+
+[Transaction\EditController::edit](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Controllers/Transaction/EditController.php#L77-L142)
+
+后端 EditController **不处理附件上传**，只渲染编辑视图。附件上传全部由前端 JS 异步完成。Controller 中没有 `AttachmentHelper` 或 `saveAttachmentsForModel` 调用。
+
+### 4.3 API 更新交易入口
+
+[Transaction\UpdateController::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php#L76-L131)
+
+调用链：`UpdateController::update` → `TransactionGroupRepository::update` → `GroupUpdateService::update`
+
+[GroupUpdateService::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupUpdateService.php#L48-L115) 的核心逻辑：
+
+1. 如果只有单笔交易（1 group = 1 journal），调用 `JournalUpdateService` 更新
+2. 如果是拆分交易，遍历提交的 transactions 数组：
+   - 有 `transaction_journal_id` 的 → 调用 `JournalUpdateService` 更新
+   - 没有 journal ID 的 → 通过 `TransactionJournalFactory` 创建新 journal
+   - 原有但未出现在提交数据中的 journal → 通过 `JournalDestroyService` **删除**
+
+[JournalUpdateService](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/JournalUpdateService.php) **不处理附件**——整个类中没有 attachment/attachable 相关代码。
+
+**API 更新交易时不涉及任何附件操作**——既不添加、不删除、也不迁移附件。
+
+### 4.4 拆分交易更新时的附件丢失风险
+
+当 API 更新拆分交易时，[GroupUpdateService::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupUpdateService.php#L84-L108) 可能删除原有的 journal：
 
 ```php
+$result = array_diff($existing, $updated);
+foreach ($result as $deletedId) {
+    $journal = $transactionGroup->transactionJournals()->find((int) $deletedId);
+    $service = app(JournalDestroyService::class);
+    $service->destroy($journal);
+}
+```
+
+[JournalDestroyService::destroy](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Destroy/JournalDestroyService.php#L35-L49) 调用 `$journal->delete()`，触发 Observer：
+
+[DeletedTransactionJournalObserver::deleting](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Handlers/Observer/DeletedTransactionJournalObserver.php#L38-L81)：
+
+```php
+foreach ($transactionJournal->attachments()->get() as $attachment) {
+    $repository->destroy($attachment);
+}
+```
+
+**结果**：如果拆分交易更新导致某个 Journal 被删除，该 Journal 上的所有附件也会被级联删除，且无法恢复。
+
+## 5. 附件更新与归属迁移入口
+
+### 5.1 API 更新附件 `PUT /api/v1/attachments/{id}`
+
+[Attachment\UpdateController::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/UpdateController.php#L69-L86)
+
+调用链：`UpdateController::update` → `AttachmentRepository::update`
+
+[AttachmentRepository::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Attachment/AttachmentRepository.php#L132-L155)：
+
+```php
+public function update(Attachment $attachment, array $data): Attachment
+{
+    // 更新 title
+    if (array_key_exists('title', $data)) {
+        $attachment->title = $data['title'];
+    }
+    // 更新 filename（仅显示名，不影响磁盘文件）
+    if (array_key_exists('filename', $data) && '' !== (string) $data['filename'] && $data['filename'] !== $attachment->filename) {
+        $attachment->filename = $data['filename'];
+    }
+    // ★ 迁移归属（move attachment）
+    if (array_key_exists('attachable_type', $data) && array_key_exists('attachable_id', $data)) {
+        $attachment->attachable_id   = (int) $data['attachable_id'];
+        $attachment->attachable_type = sprintf('FireflyIII\Models\%s', $data['attachable_type']);
+    }
+
+    $attachment->save();
+    $attachment->refresh();
+    if (array_key_exists('notes', $data)) {
+        $this->updateNote($attachment, (string) $data['notes']);
+    }
+    return $attachment;
+}
+```
+
+**此方法可以将附件从一个实体迁移到另一个实体**，包括跨类型迁移（如从 Bill 迁移到 TransactionJournal）。
+
+### 5.2 更新入口与创建入口的关键差异
+
+| 维度 | 创建入口（AttachmentFactory::create） | 更新入口（AttachmentRepository::update） |
+|---|---|---|
+| Transaction→Journal 自动提升 | **有**：自动转换 `attachable_type=Transaction` → `TransactionJournal` | **没有**：原样存储，可写入 `FireflyIII\Models\Transaction` |
+| attachable_type 格式化 | 自动补全命名空间（`FireflyIII\Models\`） | 同样补全：`sprintf('FireflyIII\Models\%s', ...)` |
+| 验证 | StoreRequest 校验 `attachable_type` 必须在 `valid_attachment_models` 内 + `IsValidAttachmentModel` 校验 ID 有效性 | UpdateRequest 校验 `attachable_type` 必须在 `valid_attachment_models` 内 + `IsValidAttachmentModel` 校验 ID 有效性 |
+| 磁盘文件处理 | 创建后需单独调用 upload 接口写入 | 更新只改元数据，**不涉及磁盘文件重命名或移动** |
+
+### 5.3 更新入口的 Transaction 落库漏洞
+
+由于 `AttachmentRepository::update` 缺少 Transaction→Journal 的自动提升逻辑，以下场景可以导致数据库中出现 `attachable_type = FireflyIII\Models\Transaction` 的记录：
+
+```
+PUT /api/v1/attachments/123
+{
+  "attachable_type": "Transaction",
+  "attachable_id": 456
+}
+```
+
+验证层 `IsValidAttachmentModel` 会通过（因为 `Transaction` 是合法模型），`AttachmentRepository::update` 会将其存为 `FireflyIII\Models\Transaction`。
+
+由于 `Transaction` 模型没有 `attachments()` 关系方法，这样的附件将成为**孤儿记录**：
+- 无法通过 `$transaction->attachments` 查到
+- 无法通过交易编辑页面管理
+- 只有通过 `GET /api/v1/attachments/{id}` 单独访问才能看到
+- 在 [TransactionGroupRepository::getAttachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L109-L136) 中查不到（硬编码 `attachable_type = TransactionJournal::class`）
+
+### 5.4 Web UI 附件编辑页面
+
+[AttachmentController::update](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Controllers/AttachmentController.php#L166-L183)
+
+Web UI 的附件编辑只允许修改 `title` 和 `notes`，**不允许修改 `attachable_type` 和 `attachable_id`**。
+
+证据：[AttachmentFormRequest::getAttachmentData](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Requests/AttachmentFormRequest.php#L45-L48)：
+
+```php
+public function getAttachmentData(): array
+{
+    return ['title' => $this->convertString('title'), 'notes' => $this->convertString('notes')];
+}
+```
+
+**归属迁移只能通过 API 完成**，Web UI 不提供此功能。
+
+## 6. 查询侧对 Transaction 类型的排除
+
+所有查询附件的代码都硬编码为 `TransactionJournal::class`，不会查到 `Transaction` 类型的附件：
+
+[TransactionGroupRepository::getAttachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L109-L136)：
+```php
 $set = Attachment::whereIn('attachable_id', $journals)
-    ->where('attachable_type', TransactionJournal::class)  // 硬编码为 TransactionJournal
+    ->where('attachable_type', TransactionJournal::class)
     ->where('uploaded', true)
     ->whereNull('deleted_at')
     ->get();
 ```
 
 [AttachmentCollection::joinAttachmentTables](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Collector/Extensions/AttachmentCollection.php#L510-L529)：
-
 ```php
 $this->query
     ->leftJoin('attachments', 'attachments.attachable_id', '=', 'transaction_journals.id')
@@ -143,7 +385,6 @@ $this->query
 ```
 
 [TransactionGroupEnrichment](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Support/JsonApi/Enrichments/TransactionGroupEnrichment.php#L169-L179)：
-
 ```php
 $attachments = Attachment::query()
     ->whereIn('attachable_id', $this->journalIds)
@@ -152,144 +393,26 @@ $attachments = Attachment::query()
     ->get(['attachable_id', DB::raw('COUNT(id) as nr_of_attachments')]);
 ```
 
-## 4. 上传入口与附件归属的协作方式
-
-### 4.1 两套上传路径
-
-| 路径 | 适用场景 | 附件归挂时机 | 归挂对象 |
-|---|---|---|---|
-| **Web UI（表单上传）** | Account / Bill / Budget / Category / PiggyBank / Tag / Recurrence 的创建和编辑 | 实体创建**之后**立即保存 | 通过 `saveAttachmentsForModel($model, $files)` 直接绑定到该模型 |
-| **API（两步上传）** | Transaction（交易）及所有其他实体 | 交易创建**之后**，前端拿到 `transaction_journal_id` 后再上传 | 前端显式传入 `attachable_type=TransactionJournal` + `attachable_id=journal_id` |
-
-### 4.2 Web UI 路径详解
-
-Web UI 中所有非交易实体的附件上传遵循相同模式，以 Bill 为例：
-
-[Bill\CreateController](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Controllers/Bill/CreateController.php#L112)：
-
+[JournalAPIRepository::getAttachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Journal/JournalAPIRepository.php#L61-L74)：
 ```php
-$recurrence = $this->repository->store($data);
-$files = $request->hasFile('attachments') ? $request->file('attachments') : null;
-$this->attachments->saveAttachmentsForModel($bill, $files);
+$set = $journal->attachments;  // 通过 MorphMany 关系加载
 ```
 
-调用链：`saveAttachmentsForModel()` → `processFile()` → 创建 Attachment 记录 + 写入磁盘文件。
+**结论**：如果通过 API 更新入口写入了 `attachable_type = Transaction` 的记录，它在上述所有查询中都会被过滤掉，成为隐形孤儿。
 
-**此路径下附件直接关联到传入的 Model 实例**，`attachable_type` 就是该模型的 FQCN。
+## 7. 附件删除与级联清理
 
-### 4.3 API 路径详解（交易场景）
+### 7.1 附件自身的删除
 
-交易创建流程分两步：
+API: `DELETE /api/v1/attachments/{id}` → [Attachment\DestroyController::destroy](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/DestroyController.php#L67-L79)
 
-**第一步**：创建交易（不涉及附件）
+Web UI: `POST /attachments/destroy/{attachment}` → [AttachmentController::destroy](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Controllers/AttachmentController.php#L79-L89)
 
-API: `POST /api/v1/transactions` → [Transaction\StoreController::store](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Transaction/StoreController.php#L85-L143)
+两者都调用 `AttachmentRepository::destroy`，删除数据库记录和磁盘文件。
 
-返回结果包含每个 `transaction_journal_id`。
+### 7.2 实体删除时级联清理附件
 
-**第二步**：前端拿到 journal ID 后上传附件
-
-API: `POST /api/v1/attachments` → [Attachment\StoreController::store](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/StoreController.php#L74-L92)
-
-前端请求体：
-```json
-{
-  "filename": "receipt.pdf",
-  "attachable_type": "TransactionJournal",
-  "attachable_id": 42
-}
-```
-
-**第三步**：上传文件内容
-
-API: `POST /api/v1/attachments/{id}/upload` → [Attachment\StoreController::upload](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/StoreController.php#L97-L121)
-
-### 4.4 前端 JS 处理逻辑
-
-[v1 CreateTransaction.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/CreateTransaction.vue#L561-L648)：
-
-```javascript
-collectAttachmentData(response) {
-    let groupId = response.data.data.id;
-    response.data.data.attributes.transactions = response.data.data.attributes.transactions.reverse();
-    let attachments = $('input[name="attachments[]"]');
-    for (const key in attachments) {
-        // ★ 将文件与对应的 transaction_journal_id 关联
-        toBeUploaded.push({
-            journal: response.data.data.attributes.transactions[key].transaction_journal_id,
-            file: attachments[key].files[fileKey]
-        });
-    }
-}
-
-uploadFiles(fileData, groupId, transactionData) {
-    const data = {
-        filename: fileData[key].name,
-        attachable_type: 'TransactionJournal',   // ★ 硬编码为 TransactionJournal
-        attachable_id: fileData[key].journal,
-    };
-    axios.post('./api/v1/attachments', data)
-        .then(response => {
-            axios.post('./api/v1/attachments/' + response.data.data.id + '/upload', fileData[key].content);
-        });
-}
-```
-
-[v2 process-attachments.js](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/shared/process-attachments.js#L61-L114)：
-
-```javascript
-export function processAttachments(groupId, transactions) {
-    transactions = transactions.reverse();
-    let attachments = document.querySelectorAll('input[name="attachments[]"]');
-    for (const key in attachments) {
-        toBeUploaded.push({
-            journal: transactions[key].transaction_journal_id,  // ★ 按 key 索引与 journal 对应
-            file: attachments[key].files[fileKey]
-        });
-    }
-}
-
-// 上传时也是硬编码 TransactionJournal
-poster.post(fileData[key].name, 'TransactionJournal', fileData[key].journal);
-```
-
-## 5. 不同交易类型下的不一致性分析
-
-### 5.1 交易类型的层级关系
-
-Firefly III 中交易类型（Withdrawal / Deposit / Transfer）通过以下层级表达：
-
-```
-TransactionType (枚举值)
-  → TransactionJournal.transaction_type_id (外键指向 TransactionType)
-    → TransactionJournal 属于 TransactionGroup
-```
-
-**所有交易类型共用相同的附件归挂逻辑**——附件始终挂在 `TransactionJournal` 上，与交易类型无关。
-
-### 5.2 TransactionGroup 没有 attachments 关系
-
-`TransactionGroup` 模型**没有**定义 `attachments()` 方法。API 获取交易组附件时，需遍历其下所有 Journal：
-
-[Transaction\ListController::attachments](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Transaction/ListController.php#L70-L94)：
-
-```php
-foreach ($transactionGroup->transactionJournals as $transactionJournal) {
-    $collection = $this->journalAPIRepository->getAttachments($transactionJournal)->merge($collection);
-}
-```
-
-### 5.3 Recurrence（定期交易）的附件归属差异
-
-Recurrence 的附件直接挂在 **Recurrence** 模型上（`attachable_type = Recurrence`），而不是挂在某个 Journal 上。这是因为 Recurrence 创建时尚未生成实际的 TransactionJournal，后者是在 Recurrence 被触发执行时才创建的。
-
-**关键问题**：Recurrence 触发生成 TransactionJournal 时，**不会复制附件**到新生成的 Journal 上。
-
-[GroupCloneService::cloneJournal](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupCloneService.php#L67-L120) 中克隆 Journal 时会复制 notes、meta、categories、budgets、tags，但 **没有克隆 attachments**。
-
-### 5.4 各实体 Observer 对附件的清理
-
-当实体被删除时，对应的附件通过 Observer 自动清理：
+通过 Observer 模式实现，当实体被删除时自动清理其附件：
 
 | Observer | 代码位置 |
 |---|---|
@@ -299,10 +422,15 @@ Recurrence 的附件直接挂在 **Recurrence** 模型上（`attachable_type = R
 | DeletedRecurrenceObserver | [L43-L45](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Handlers/Observer/DeletedRecurrenceObserver.php#L43-L45) |
 | DeletedTagObserver | [L43-L45](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Handlers/Observer/DeletedTagObserver.php#L43-L45) |
 | PiggyBankObserver | [L55-L57](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Handlers/Observer/PiggyBankObserver.php#L55-L57) |
+| BillDestroyService | [L42-L43](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Destroy/BillDestroyService.php#L42-L43) |
+| BudgetDestroyService | [L51-L52](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Destroy/BudgetDestroyService.php#L51-L52) |
 
-**注意**：`DeletedTransactionGroupObserver` **不会**清理附件，因为附件不属于 Group。附件通过 `DeletedTransactionJournalObserver` 随 Journal 删除而级联删除。
+**注意**：
+- `DeletedTransactionGroupObserver` **不会**清理附件——Group 没有附件关系
+- `DeletedTransactionJournalObserver` **会**清理附件——Journal 有 `attachments()` 关系
+- 如果附件的 `attachable_type` 是 `Transaction`，删除该 Transaction 时 **不会**触发附件清理（因为 Transaction 没有 `attachments()` 关系），这也是孤儿问题的表现之一
 
-## 6. 验证层：IsValidAttachmentModel
+## 8. 验证层：IsValidAttachmentModel
 
 [IsValidAttachmentModel](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Rules/IsValidAttachmentModel.php#L49-L87) 对 API 请求中的 `attachable_type` + `attachable_id` 进行验证：
 
@@ -320,99 +448,126 @@ $result = match ($this->model) {
 };
 ```
 
-API StoreRequest ([StoreRequest::rules](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Requests/Models/Attachment/StoreRequest.php#L59-L73)) 同时验证 `attachable_type` 必须在 `valid_attachment_models` 列表内。
+其中 `validateTransaction` 调用 [JournalAPIRepository::findTransaction](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Journal/JournalAPIRepository.php#L47-L54)，验证 Transaction ID 是否存在且属于当前用户。
 
-## 7. 不一致问题总结
+**StoreRequest** ([StoreRequest::rules](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Requests/Models/Attachment/StoreRequest.php#L59-L73))：
+- `attachable_type` 必须 `in:Account,Bill,Budget,...` 列表
+- `attachable_id` 必须通过 `IsValidAttachmentModel` 验证
 
-### 7.1 Transaction 作为合法 attachable_type 但实际不存在
+**UpdateRequest** ([UpdateRequest::rules](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Requests/Models/Attachment/UpdateRequest.php#L61-L75))：
+- `attachable_type` 必须 `in:Account,Bill,Budget,...` 列表（但非 required，可选更新）
+- `attachable_id` 必须通过 `IsValidAttachmentModel` 验证（但非 required，可选更新）
+- **两个条件必须同时出现**才会触发归属迁移（见 `AttachmentRepository::update` 中的 `array_key_exists` 检查）
 
-- 配置中 `Transaction::class` 是合法的 `attachable_type`
-- `IsValidAttachmentModel` 能验证 Transaction
-- 但 `AttachmentFactory::create` 会将 Transaction **自动转换** 为 TransactionJournal
-- `Transaction` 模型没有声明 `attachments()` 关系方法
-- **结果**：数据库中永远不会出现 `attachable_type = Transaction` 的记录，配置声明与实际行为不一致
+## 9. 不一致问题总结
 
-### 7.2 Recurrence 的附件不会传递到生成的交易
+### 9.1 附件更新入口缺少 Transaction→Journal 自动提升
+
+- 创建入口 `AttachmentFactory::create` 有 Transaction→Journal 转换
+- 更新入口 `AttachmentRepository::update` 没有此转换
+- 通过 API 更新附件可以将 `attachable_type` 设为 `Transaction`，产生孤儿记录
+- 查询侧全部硬编码 `TransactionJournal::class`，孤儿记录无法被正常检索
+- 删除 Transaction 时不会清理挂在其上的附件（无 Observer）
+
+### 9.2 交易创建/编辑/API 更新三类入口均不处理附件
+
+| 入口 | 附件操作 | 说明 |
+|---|---|---|
+| 交易创建（Web UI） | 前端异步上传到 Journal | 后端不感知附件 |
+| 交易编辑（Web UI） | 前端异步上传到 Journal | 后端不感知附件，只能追加不能删除 |
+| API 创建交易 | 不处理 | 用户需单独调用附件 API |
+| API 更新交易 | 不处理 | `GroupUpdateService` / `JournalUpdateService` 无附件代码 |
+
+### 9.3 拆分交易更新可能级联删除附件
+
+API 更新拆分交易时，如果减少了 split 数量，多余的 Journal 会被删除，其上的附件也通过 Observer 级联删除，不可恢复。
+
+### 9.4 Recurrence 的附件不会传递到生成的交易
 
 - Recurrence 的附件归挂在 Recurrence 自身
 - Recurrence 触发生成 TransactionJournal 时，附件不会自动复制
-- 用户需要分别为 Recurrence 和生成的交易添加附件
 
-### 7.3 克隆交易不复制附件
+### 9.5 克隆交易不复制附件
 
-- [GroupCloneService](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupCloneService.php#L67-L120) 克隆 Journal 时复制了 notes、meta、categories、budgets、tags，但遗漏了 attachments
+[GroupCloneService::cloneJournal](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupCloneService.php#L67-L120) 克隆 Journal 时复制了 notes、meta、categories、budgets、tags，但遗漏了 attachments。
 
-### 7.4 Web UI 与 API 的附件上传时机差异
+### 9.6 Web UI 与 API 的附件管理能力差异
 
-- Web UI 非交易实体：在实体创建的同一请求中同步上传附件
-- Web UI 交易：前端先创建交易，再异步调用 API 上传附件
-- API 交易：始终是两步操作（先 POST 交易 → 再 POST 附件 + 上传内容）
+- Web UI 附件编辑页面只能修改 title/notes，**不能迁移归属**
+- API 附件更新可以修改 `attachable_type`/`attachable_id`，**可以迁移归属**
+- 但 API 迁移归属缺少 Transaction→Journal 的保护逻辑
 
-### 7.5 AttachmentCollection 的 LEFT JOIN 可能产生笛卡尔积
-
-[AttachmentCollection::joinAttachmentTables](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Collector/Extensions/AttachmentCollection.php#L510-L529) 使用 `leftJoin` 将 attachments 表连接到 transaction_journals，如果一个 Journal 有多个附件，查询结果会产生多行，需要后续在 PHP 层面进行聚合处理。
-
-## 8. 完整调用链图
+## 10. 完整调用链图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        附件上传入口总览                                   │
-├──────────────────┬──────────────────────┬───────────────────────────────┤
-│ 入口             │ 归挂目标              │ 调用路径                      │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Account              │ Controller                    │
-│ Account          │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Bill                 │ Controller                    │
-│ Bill             │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Budget               │ Controller                    │
-│ Budget           │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Category             │ Controller                    │
-│ Category         │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ PiggyBank            │ Controller                    │
-│ PiggyBank        │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Tag                  │ Controller                    │
-│ Tag              │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建/编辑    │ Recurrence           │ Controller                    │
-│ Recurrence       │                      │ → saveAttachmentsForModel()   │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建交易     │ TransactionJournal   │ JS collectAttachmentData()    │
-│ (v1 Vue)         │                      │ → axios POST /api/v1/attach.. │
-│                  │                      │ → axios POST /upload          │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Web 创建交易     │ TransactionJournal   │ JS processAttachments()       │
-│ (v2)             │                      │ → AttachmentPost.post()       │
-│                  │                      │ → AttachmentPost.upload()     │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ API 直接创建     │ 任意合法模型          │ POST /api/v1/attachments      │
-│ 附件             │ (含Transaction)      │ → AttachmentFactory::create() │
-│                  │                      │ → Transaction 自动转为 Journal│
-│                  │                      │ POST /api/v1/attachments/{id} │
-│                  │                      │ /upload                       │
-└──────────────────┴──────────────────────┴───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          附件操作入口总览                                      │
+├────────────────────┬──────────────────┬───────────────────────────────────────┤
+│ 入口               │ 归挂目标          │ 调用路径                               │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Web 创建/编辑       │ Account          │ Controller                            │
+│ Account/Bill/等    │ Bill 等          │ → saveAttachmentsForModel()           │
+│                    │                  │ → AttachmentHelper::processFile()     │
+│                    │                  │ ★ attachable()->associate($model)     │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Web 创建交易       │ TransactionJournal│ 前端 JS → POST /api/v1/attachments    │
+│ (v1 / v2)         │                  │ → AttachmentFactory::create()         │
+│                    │                  │ ★ 前端硬编码 TransactionJournal        │
+│                    │                  │ → POST /api/v1/attachments/{id}/upload│
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Web 编辑交易       │ TransactionJournal│ 同创建交易流程                          │
+│ (v1 / v2)         │                  │ ★ 只能追加，不能删除已有附件              │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ API 创建交易       │ 不处理附件        │ Transaction\StoreController           │
+│                    │                  │ 用户需单独调用附件 API                   │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ API 更新交易       │ 不处理附件        │ GroupUpdateService                    │
+│                    │                  │ JournalUpdateService                  │
+│                    │                  │ ★ 可能删除 Journal → 级联删除附件       │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ API 创建附件       │ Transaction→Journal│ POST /api/v1/attachments             │
+│                    │ 自动提升          │ → AttachmentFactory::create()         │
+│                    │ 其他类型原样存储   │ ★ Transaction 自动转为 Journal         │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ API 更新附件       │ 原样存储          │ PUT /api/v1/attachments/{id}          │
+│ (归属迁移)         │ ★ 无自动提升     │ → AttachmentRepository::update()      │
+│                    │                  │ ★ Transaction 可能原样落库             │
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Web 编辑附件       │ 不可迁移归属      │ AttachmentController::update          │
+│                    │                  │ → AttachmentRepository::update()      │
+│                    │                  │ ★ AttachmentFormRequest 只含 title/notes│
+├────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ API/Web 删除附件   │ 删除记录+磁盘文件 │ AttachmentRepository::destroy()       │
+│                    │                  │ → 删除 at-{id}.data                   │
+└────────────────────┴──────────────────┴───────────────────────────────────────┘
 ```
 
-## 9. 核心文件索引
+## 11. 核心文件索引
 
 | 文件 | 职责 |
 |---|---|
 | [Attachment.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Models/Attachment.php) | 附件模型，定义 MorphTo 关系 |
-| [AttachmentFactory.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Factory/AttachmentFactory.php) | 工厂类，含 Transaction→Journal 转换逻辑 |
-| [AttachmentHelper.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Attachments/AttachmentHelper.php) | Web UI 附件上传核心，含 saveAttachmentsForModel / saveAttachmentFromApi |
-| [AttachmentRepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Attachment/AttachmentRepository.php) | 附件仓库，store/update/destroy |
+| [AttachmentFactory.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Factory/AttachmentFactory.php) | 创建工厂，含 Transaction→Journal 自动提升逻辑 |
+| [AttachmentHelper.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Attachments/AttachmentHelper.php) | Web UI 附件上传核心，saveAttachmentsForModel / saveAttachmentFromApi |
+| [AttachmentRepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/Attachment/AttachmentRepository.php) | 附件仓库，store/update/destroy；update 中**缺少** Transaction→Journal 提升 |
 | [AttachmentController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Controllers/AttachmentController.php) | Web UI 附件管理（编辑/删除/下载/查看） |
 | [Attachment\StoreController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/StoreController.php) | API 附件创建 + 上传 |
+| [Attachment\UpdateController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/UpdateController.php) | API 附件更新（含归属迁移） |
+| [Attachment\DestroyController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Attachment/DestroyController.php) | API 附件删除 |
 | [Attachment\StoreRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Requests/Models/Attachment/StoreRequest.php) | API 附件创建请求验证 |
+| [Attachment\UpdateRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Requests/Models/Attachment/UpdateRequest.php) | API 附件更新请求验证 |
+| [AttachmentFormRequest.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Http/Requests/AttachmentFormRequest.php) | Web UI 附件编辑请求（仅 title/notes） |
 | [IsValidAttachmentModel.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Rules/IsValidAttachmentModel.php) | 验证 attachable_type + attachable_id 的合法性 |
+| [Transaction\UpdateController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php) | API 交易更新（不处理附件） |
+| [GroupUpdateService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupUpdateService.php) | 交易组更新服务（不处理附件，可能删除 Journal → 级联删除附件） |
+| [JournalUpdateService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/JournalUpdateService.php) | Journal 更新服务（不处理附件） |
+| [JournalDestroyService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Destroy/JournalDestroyService.php) | Journal 删除服务，触发 Observer |
+| [DeletedTransactionJournalObserver.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Handlers/Observer/DeletedTransactionJournalObserver.php) | Journal 删除时级联删除附件 |
 | [AttachmentCollection.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Helpers/Collector/Extensions/AttachmentCollection.php) | 交易查询时 LEFT JOIN 附件表 |
 | [TransactionGroupRepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php) | 交易组仓库，getAttachments / countAttachments |
 | [TransactionGroupEnrichment.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Support/JsonApi/Enrichments/TransactionGroupEnrichment.php) | 交易组数据富化，统计每个 Journal 的附件数量 |
 | [GroupCloneService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/app/Services/Internal/Update/GroupCloneService.php) | 交易克隆服务（不复制附件） |
-| [process-attachments.js](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/shared/process-attachments.js) | v2 前端附件上传处理 |
-| [CreateTransaction.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/CreateTransaction.vue) | v1 前端交易创建（含附件上传） |
+| [EditTransaction.vue](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v1/src/components/transactions/EditTransaction.vue) | v1 前端交易编辑（含附件上传） |
+| [process-attachments.js](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/shared/process-attachments.js) | v2 前端附件上传处理（创建/编辑共用） |
+| [edit.js](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/resources/assets/v2/src/pages/transactions/edit.js) | v2 前端交易编辑入口 |
 | [firefly.php](file:///d:/fz/0508-2/solo-dogfeeding/code/127-firefly-iii/config/firefly.php#L213-L223) | valid_attachment_models 配置 |
