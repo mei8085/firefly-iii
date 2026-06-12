@@ -595,6 +595,504 @@ LIMIT 1
 
 但这个局部保障**仅限于补偿交易内部**，不会回滚 submit() STEP 1 中已标记的对账流水。
 
+### 10.6 补偿交易创建各阶段失败的残留步骤深度分析
+
+前述的"局部事务保障"只覆盖了两条 Transaction 创建的阶段。实际上补偿交易创建是一个**多阶段流水线**，越靠后的阶段失败，残留的数据越多。以下按执行顺序逐阶段拆解。
+
+#### 10.6.1 阶段总览：创建流水线与清理覆盖范围
+
+补偿交易创建涉及三层工厂的协作，完整流水线如下：
+
+```
+createReconciliation()
+    │
+    └─ TransactionGroupFactory::create()
+         │  （第三层：组包装）
+         │
+         └─ TransactionJournalFactory::create()  ← 有 try-catch + forceDeleteOnError
+              │  （第二层：日记账循环）
+              │
+              └─ createJournal()  ← 仅部分阶段有 catch 清理
+                   │  （第一层：日记账核心构造）
+                   │
+                   ├─ P1: hashArray + errorIfDuplicate
+                   ├─ P2: validateAccounts
+                   ├─ P3: findCurrency / findBill
+                   ├─ P4: getAccount × 2（source + destination）
+                   ├─ P5: TransactionJournal::create()  ← journal 入库
+                   ├─ P6: TransactionFactory::createNegative()  ← 负侧 Transaction 入库
+                   ├─ P7: TransactionFactory::createPositive()  ← 正侧 Transaction 入库
+                   ├─ P8: $journal->save()
+                   ├─ P9: storeBudget()
+                   ├─ P10: storeCategory()
+                   ├─ P11: storeNotes()
+                   ├─ P12: storePiggyEvent()
+                   ├─ P13: storeTags()
+                   ├─ P14: storeMetaFields()
+                   └─ P15: storeLocation()
+
+         ─────── create() 返回后，进入 GroupFactory ───────
+                   │
+                   ├─ G1: 空集合检查（0 === count）
+                   ├─ G2: TransactionGroup::save()  ← group 入库
+                   ├─ G3: transactionJournals()->saveMany()  ← 关联 group 和 journals
+                   └─ 返回 group
+```
+
+**清理逻辑的覆盖盲区**：
+- ✅ P5-P7 失败：有 `catch (FireflyException)` → `forceDeleteOnError` 清理
+- ❌ P8-P15 失败：**没有任何 try-catch** → 异常直接向上冒泡
+- ❌ G1-G3 失败：**没有任何 try-catch** → 异常直接向上冒泡
+- 而且 `createReconciliation()` 只捕获 `FireflyException`，非 FireflyException 的异常（如 PDOException、QueryException）**全部漏捕获**
+
+#### 10.6.2 P5~P7 失败：有清理，无残留（已知保障）
+
+对应代码第 352-398 行（`createNegative` 和 `createPositive` 周围的 catch 块）：
+
+| 失败点 | 已创建数据 | catch 中的清理动作 | 最终残留 |
+|-------|-----------|-------------------|---------|
+| P5 `TransactionJournal::create()` | —（还没创建成功） | — | 无 |
+| P6 `createNegative()` 失败 | 1 个 journal | `forceDeleteOnError([journal])` → 调 JournalDestroyService::destroy() 删除 journal + 级联删 transactions | **无残留** |
+| P7 `createPositive()` 失败 | 1 个 journal + 1 条负 Transaction | ① `forceTrDelete($negative)` 删负 Transaction ② `forceDeleteOnError([journal])` 删 journal | **无残留** |
+
+**注意**：这里的清理仅对 `FireflyException` 有效。如果 TransactionFactory 内部抛出的是 `\PDOException` 或 `QueryException`（非 FireflyException 子类），则不会被 catch 捕获，**残留会和后续阶段一样严重**。
+
+#### 10.6.3 P8~P15 逐步写入流程与失败残留详解
+
+P8 到 P15 是 [createJournal()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L400-L407) 方法的尾部步骤（第 400-407 行），**全部在 try-catch 之外**，任何一步抛出异常都无清理逻辑。以下逐步骤精确追踪写入的数据表和可能抛出的异常类型。
+
+##### P8: `$journal->save()` — journal 二次保存
+
+```php
+// TransactionJournalFactory.php 第 400 行
+$journal->save();
+```
+
+- **写入的表**：`transaction_journals`（UPDATE，journal 已在 P5 创建并 INSERT）
+- **实际变更**：更新 `updated_at` 时间戳；更新 P5~P7 过程中可能被改变的属性（如 `completed` 字段——在第 341 行设置 `'completed' => is_bool($row['batch_submission']) && !$row['batch_submission']`，但对账交易的 `batch_submission` 默认为 false，所以 `completed = true`）
+- **可能抛出的异常**：`QueryException`（如数据库连接断开、字段长度溢出等），**不是** `FireflyException`
+- **若失败残留**：journal 已存在于 DB（P5 创建），两条 Transaction 已存在（P6/P7 创建）→ 余额已被改变但无 group 无元数据
+
+##### P9: `storeBudget()` — 预算关联
+
+```php
+// JournalServiceTrait.php 第 154-170 行
+protected function storeBudget(TransactionJournal $journal, NullArrayObject $data): void
+{
+    if (TransactionTypeEnum::WITHDRAWAL->value !== $journal->transactionType->type) {
+        $journal->budgets()->sync([]);  // ← 对账交易走这条分支！
+        return;
+    }
+    // ... 以下对账交易不会执行
+}
+```
+
+- **写入的表**：`budget_transaction_journal`（pivot 表），执行 `sync([])`
+- **对账交易的实际行为**：类型为 `Reconciliation` ≠ `Withdrawal`，所以直接 `sync([])`（空数组），即确保无预算关联
+- **可能抛出的异常**：`QueryException`（pivot 表写入失败），**不是** `FireflyException`
+- **若失败残留**：journal + 2 条 transactions 已入库（P5-P7 的成果保留）
+
+##### P10: `storeCategory()` — 分类关联
+
+```php
+// JournalServiceTrait.php 第 172-183 行
+protected function storeCategory(TransactionJournal $journal, NullArrayObject $data): void
+{
+    $category = $this->categoryRepository->findCategory($data['category_id'], $data['category_name']);
+    if (null !== $category) {
+        $journal->categories()->sync([$category->id]);
+        return;
+    }
+    $journal->categories()->sync([]);  // ← 对账交易走这条分支！
+}
+```
+
+- **写入的表**：`category_transaction_journal`（pivot 表），执行 `sync([])`
+- **对账交易的实际行为**：`category_id` 和 `category_name` 均为 null → `findCategory` 返回 null → `sync([])`
+- **可能抛出的异常**：`QueryException`
+- **若失败残留**：journal + 2 条 transactions + P9 的 budgets sync 结果
+
+##### P11: `storeNotes()` — 备注写入
+
+```php
+// JournalServiceTrait.php 第 185-202 行
+protected function storeNotes(TransactionJournal $journal, ?string $notes): void
+{
+    $notes = (string) $notes;
+    $note  = $journal->notes()->first();
+    if ('' !== $notes) {
+        if (null === $note) {
+            $note = new Note();
+            $note->noteable()->associate($journal);
+        }
+        $note->text = $notes;
+        $note->save();
+        return;
+    }
+    $note?->delete();  // ← 对账交易走这条分支（notes 为空）
+}
+```
+
+- **写入的表**：`notes`（Note 模型）
+- **对账交易的实际行为**：`$notes` 参数为 null → `(string)null = ''` → 走 delete 分支 → journal 无已有 note → 无操作
+- **可能抛出的异常**：极端情况下 `QueryException`
+- **若失败残留**：journal + 2 条 transactions + P9-P10 的 sync 结果
+
+##### P12: `storePiggyEvent()` — 储蓄罐事件
+
+```php
+// TransactionJournalFactory.php 第 606-619 行
+private function storePiggyEvent(TransactionJournal $journal, NullArrayObject $data): void
+{
+    $piggyBank = $this->piggyRepository->findPiggyBank((int) $data['piggy_bank_id'], $data['piggy_bank_name']);
+    if ($piggyBank instanceof PiggyBank) {
+        $this->piggyEventFactory->create($journal, $piggyBank);
+        return;
+    }
+    Log::debug('Create no piggy event');  // ← 对账交易走这条分支
+}
+```
+
+- **写入的表**：`piggy_bank_events`
+- **对账交易的实际行为**：`piggy_bank_id` 和 `piggy_bank_name` 均为 null → `findPiggyBank` 返回 null → 跳过
+- **可能抛出的异常**：无（本步骤对账交易跳过）
+- **若失败残留**：不适用于对账场景
+
+##### P13: `storeTags()` — 标签关联
+
+```php
+// JournalServiceTrait.php 第 207-237 行
+protected function storeTags(TransactionJournal $journal, ?array $tags): void
+{
+    // ...
+    if (!is_array($tags)) {
+        Log::debug('Tags is not an array, break.');
+        return;                           // ← 对账交易走这条分支！
+    }
+    // ...
+    try {
+        $journal->tags()->sync($set);
+    } catch (UniqueConstraintViolationException $e) {
+        Log::error(sprintf('Firefly III could not sync tags: %s', $e->getMessage()));
+    }
+}
+```
+
+- **写入的表**：`tag_transaction_journal`（pivot 表）
+- **对账交易的实际行为**：`$tags` 为 null → `!is_array(null)` = true → 直接 return，无任何 DB 操作
+- **可能抛出的异常**：无（本步骤对账交易直接跳过）
+- **若失败残留**：不适用于对账场景
+- **⚠️ 设计亮点**：即使走到 `sync()` 分支，也有 `catch (UniqueConstraintViolationException)` 兜底，**静默失败不抛出**，是 P8-P15 中唯一自带容错处理的步骤
+
+##### P14: `storeMetaFields()` — 元数据逐字段写入
+
+```php
+// TransactionJournalFactory.php 第 596-601 行
+private function storeMetaFields(TransactionJournal $journal, NullArrayObject $transaction): void
+{
+    foreach ($this->fields as $field) {             // $this->fields = config('firefly.journal_meta_fields')
+        $this->storeMeta($journal, $transaction->getArrayCopy(), $field);
+    }
+}
+
+// TransactionJournalFactory.php 第 189-203 行
+protected function storeMeta(TransactionJournal $journal, array $data, string $field): void
+{
+    $set = ['journal' => $journal, 'name' => $field, 'data' => (string) ($data[$field] ?? '')];
+    // ...
+    $factory = app(TransactionJournalMetaFactory::class);
+    $factory->updateOrCreate($set);                // ← 逐字段调用
+}
+```
+
+[TransactionJournalMetaFactory::updateOrCreate()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalMetaFactory.php#L36-L77) 的逻辑：
+
+```php
+public function updateOrCreate(array $data): ?TransactionJournalMeta
+{
+    $value = $data['data'];
+    $entry = $data['journal']->transactionJournalMeta()->where('name', $data['name'])->first();
+
+    if (null === $value && null !== $entry) { $entry->delete(); return null; }
+    if ('' === (string) $value) {
+        if (null !== $entry) { $entry->delete(); }
+        return null;             // ← 大部分字段的空值走这条分支，不写 DB
+    }
+
+    if (null === $entry) {
+        $entry = new TransactionJournalMeta();
+        $entry->transactionJournal()->associate($data['journal']);
+        $entry->name = $data['name'];
+    }
+    $entry->data = $value;
+    $entry->save();              // ← 只有非空值才会写 DB
+
+    return $entry;
+}
+```
+
+- **写入的表**：`journal_meta`（`transaction_journal_meta` 表）
+- **对账交易实际写入的字段**：取决于 `config('firefly.journal_meta_fields')` 和提交数据
+  - `import_hash_v2`：**始终写入**（在 P1 的 `hashArray()` 中生成，值非空）
+  - `original_source`：可能写入
+  - 其他字段（`recurrence_id`、`sepa_*`、`external_id` 等）：对账交易通常为空 → 跳过不写
+- **关键行为**：`foreach` 循环逐字段处理，每个字段是独立的 `updateOrCreate()` 调用
+- **可能抛出的异常**：`QueryException`（任一字段写入时 DB 错误），**不是** `FireflyException`
+- **若失败残留**：失败前已写入的 meta 字段保留在 DB 中，后续字段缺失
+- **最关键的字段**：`import_hash_v2` 是重复交易检测的依据（参见 10.3.3 节），如果 P14 失败导致此字段未写入，则该 journal 不会被重复检测命中
+
+##### P15: `storeLocation()` — 地理位置写入
+
+```php
+// TransactionJournalFactory.php 第 584-594 行
+private function storeLocation(TransactionJournal $journal, NullArrayObject $data): void
+{
+    if (!in_array(null, [$data['longitude'], $data['latitude'], $data['zoom_level']], true)) {
+        $location = new Location();
+        $location->longitude = $data['longitude'];
+        $location->latitude = $data['latitude'];
+        $location->zoom_level = $data['zoom_level'];
+        $location->locatable()->associate($journal);
+        $location->save();
+    }
+    // ← 对账交易三个值均为 null → in_array(null, [...], true) = true → 跳过
+}
+```
+
+- **写入的表**：`locations`
+- **对账交易的实际行为**：经纬度均为 null → 条件不满足 → 完全跳过
+- **可能抛出的异常**：无（本步骤对账交易跳过）
+
+##### P8~P15 对账场景的实际写入摘要
+
+由于对账交易（`Reconciliation` 类型）的提交数据中大部分关联字段为空，实际写入操作远少于普通交易：
+
+| 步骤 | 对账交易实际操作 | 是否写 DB | 失败可能性 |
+|-----|----------------|----------|-----------|
+| P8 `$journal->save()` | UPDATE journal（刷新 updated_at, completed=true） | ✅ 是 | 低（但 DB 异常可发生） |
+| P9 `storeBudget()` | `sync([])` 确保 Reconciliation 类型无预算 | ✅ 是（写空） | 低 |
+| P10 `storeCategory()` | `sync([])` 确保无分类 | ✅ 是（写空） | 低 |
+| P11 `storeNotes()` | 无操作（notes 为空，journal 也无旧 note） | ❌ 否 | 无 |
+| P12 `storePiggyEvent()` | 跳过（无储蓄罐关联） | ❌ 否 | 无 |
+| P13 `storeTags()` | 跳过（tags 为 null） | ❌ 否 | 无 |
+| P14 `storeMetaFields()` | 写入 `import_hash_v2` 等非空字段 | ✅ 是 | **中等**（循环写入多个字段） |
+| P15 `storeLocation()` | 跳过（无地理位置） | ❌ 否 | 无 |
+
+**结论**：对账场景下 P8-P15 中真正有 DB 写入风险的步骤是 **P8、P9、P10、P14**，其中 P14（元数据写入）是最可能因 DB 异常而失败的步骤。
+
+##### P8~P15 失败后的残留状态
+
+| 数据表 | 是否残留 | 说明 |
+|-------|---------|------|
+| `transaction_journals` | ✅ 1 条 | P5 创建，P8 可能更新了部分字段 |
+| `transactions` | ✅ 2 条 | P6/P7 创建，源侧负金额 + 目标侧正金额 |
+| `budget_transaction_journal` | 部分 | P9 的 `sync([])` 可能已执行 |
+| `category_transaction_journal` | 部分 | P10 的 `sync([])` 可能已执行 |
+| `notes` | ❌ 无 | P11 对账交易不写 note |
+| `tag_transaction_journal` | ❌ 无 | P13 对账交易不写 tag |
+| `journal_meta` | 部分 | P14 逐字段写入，`import_hash_v2` 可能已写入，后续字段可能缺失 |
+| `locations` | ❌ 无 | P15 对账交易不写 location |
+| `transaction_groups` | ❌ 无 | 还没到 Group 阶段 |
+
+##### P8~P15 异常传递链
+
+```
+P8/P9/P10/P14 抛出 QueryException 或 PDOException
+  → createJournal() 无 try-catch（P8-P15 在 catch 块之外）→ 直接冒泡
+  → TransactionJournalFactory::create() 第 141 行
+      → catch (FireflyException $e): ❌ 类型不匹配，漏捕获
+      → catch (DuplicateTransactionException $e): ❌ 类型不匹配，漏捕获
+  → TransactionGroupFactory::create(): ❌ 无任何 catch
+  → createReconciliation() 第 264 行: catch (FireflyException $e): ❌ 类型不匹配，漏捕获
+  → submit(): ❌ 无 catch
+  → Laravel 全局异常处理器: 返回 500 错误页面
+```
+
+**⚠️ 关键发现**：P8-P15 抛出的 `QueryException` / `PDOException` 在**整个调用链中没有任何一层能捕获**，必然导致 500 错误。而且 [TransactionJournalFactory::create()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L134-L148) 的 catch 块只覆盖 `DuplicateTransactionException` 和 `FireflyException`，其他异常**既不会被清理也不会被转换**。
+
+#### 10.6.4 G1~G3 Group 关联阶段：saveMany 机制与失败残留详解
+
+journals 创建成功后，回到 [TransactionGroupFactory::create()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionGroupFactory.php#L57-L90) 执行组包装。这一阶段**完全没有 try-catch 和清理逻辑**。
+
+##### G1: 空集合检查
+
+```php
+// TransactionGroupFactory.php 第 77-79 行
+if (0 === $collection->count()) {
+    throw new FireflyException('Created zero transaction journals.');
+}
+```
+
+- **前提**：对账交易只有 1 条 journal，`count() = 1`，**不会进入此分支**
+- **此步骤对对账交易无风险**
+
+##### G2: `$group->save()` — 创建 TransactionGroup
+
+```php
+// TransactionGroupFactory.php 第 81-85 行
+$group = new TransactionGroup();
+$group->user()->associate($this->user);
+$group->userGroup()->associate($this->userGroup);
+$group->title = $title;        // 对账交易的 group_title = null
+$group->save();                // ← INSERT INTO transaction_groups
+```
+
+- **写入的表**：`transaction_groups`
+- **写入内容**：`user_id`、`user_group_id`、`title = null`、`created_at`、`updated_at`
+- **可能抛出的异常**：`QueryException`（DB 连接失败、磁盘满等）
+- **若失败残留**：
+  - `transaction_groups`：❌ 未写入（save 失败）
+  - `transaction_journals`：✅ 1 条（P5 创建），但 `transaction_group_id = null`（尚未关联）
+  - `transactions`：✅ 2 条（P6/P7 创建）
+  - `journal_meta` 等：✅ P14 写入的部分元数据
+
+##### G3: `$group->transactionJournals()->saveMany($collection)` — 关联 journals 到 group
+
+```php
+// TransactionGroupFactory.php 第 87 行
+$group->transactionJournals()->saveMany($collection);
+```
+
+这是 Laravel Eloquent 的 `saveMany()` 方法，属于 `HasMany` 关系。其内部机制：
+
+1. 遍历 `$collection` 中的每个 `TransactionJournal`
+2. 对每个 journal 调用 `$journal->save()`，在 save 之前设置 `$journal->transaction_group_id = $group->id`
+3. 每个 save 是独立的 SQL UPDATE
+
+**对账场景**：collection 中只有 1 条 journal，所以 `saveMany()` 只会执行 1 次 UPDATE：
+
+```sql
+UPDATE transaction_journals
+SET transaction_group_id = :groupId, updated_at = :timestamp
+WHERE id = :journalId
+```
+
+- **写入的表**：`transaction_journals`（UPDATE，设置 `transaction_group_id`）
+- **可能抛出的异常**：`QueryException`
+- **若失败残留**：
+  - `transaction_groups`：✅ 1 条（G2 已保存）
+  - `transaction_journals`：✅ 1 条，但 `transaction_group_id` 可能为 null（saveMany 失败前）或已设置（saveMany 成功但后续 journal 处理失败——对账只有 1 条 journal，不存在此情况）
+  - `transactions`：✅ 2 条
+
+##### G2/G3 失败的完整性风险深度分析
+
+**外键约束**：根据迁移文件 [2019_03_22_183214_changes_for_v480.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/database/migrations/2019_03_22_183214_changes_for_v480.php#L124) 第 124 行：
+
+```php
+$table->foreign('transaction_group_id')
+      ->references('id')->on('transaction_groups')
+      ->onDelete('cascade');
+```
+
+`transaction_journals.transaction_group_id` 指向 `transaction_groups.id` 的外键设置了 **`onDelete('cascade')`**。这意味着：
+
+- ✅ 如果 group 被删除，其下所有 journal 会被数据库级联删除
+- ❌ 但 **`transaction_group_id = null` 的 journal 不受此约束影响**——外键只对非 null 值生效
+
+**"孤儿 journal" 的具体含义**：
+
+若 G2 失败（group 未创建），journal 的 `transaction_group_id` 仍为 P5 创建时的初始值。查看 [TransactionJournal](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Models/TransactionJournal.php#L60-L72) 的 `$fillable`：
+
+```php
+protected $fillable = [
+    'user_id', 'user_group_id', 'transaction_type_id',
+    'bill_id', 'tag_count', 'transaction_currency_id',
+    'description', 'completed', 'order', 'date', 'date_tz',
+];
+```
+
+**`transaction_group_id` 不在 `$fillable` 中**！也就是说 P5 的 `TransactionJournal::create([...])` 不会设置此字段，其值取决于数据库列的默认值（通常为 null）。
+
+**孤儿 journal 的 UI 影响**：
+
+- Firefly III 的账户详情页（`accounts.show`）通过查询 `transaction_groups` 来展示交易列表
+- 孤儿 journal 不属于任何 group → **不会出现在交易列表中**
+- 但 [Steam::accountsBalancesOptimized()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Support/Steam.php#L72-L157) 直接查 `transactions` 表 → **余额计算仍然包含此 journal 的两条 Transaction**
+- **后果**：余额被默默改变，UI 上看不到对应交易记录，用户无法通过正常操作定位这笔补偿交易
+
+**DeletedTransactionGroupObserver 的级联删除机制**：
+
+[DeletedTransactionGroupObserver](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Handlers/Observer/DeletedTransactionGroupObserver.php#L34-L40)：
+
+```php
+public function deleting(TransactionGroup $transactionGroup): void
+{
+    foreach ($transactionGroup->transactionJournals()->get() as $journal) {
+        $journal->delete();   // 软删除 group 时，级联软删除其下所有 journal
+    }
+}
+```
+
+这意味着：group 被软删除 → 其下所有 journal 也被软删除 → 这些 journal 的 transactions 也因 `WHERE deleted_at IS NULL` 而从余额计算中消失。
+
+但对于孤儿 journal（`transaction_group_id = null`），**没有任何 group 触发此 observer**，所以孤儿 journal 只能被手动发现和删除。
+
+#### 10.6.5 forceDeleteOnError 清理的实际范围与局限
+
+[forceDeleteOnError()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L450-L460) 调用 [JournalDestroyService::destroy()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Services/Internal/Destroy/JournalDestroyService.php#L35-L49)：
+
+```php
+public function destroy(TransactionJournal $journal): void
+{
+    $group = $journal->transactionGroup;
+    if (null !== $group) {
+        $count = $group->transactionJournals->count();
+        if (0 === $count) {
+            $group->delete();    // 触发 DeletedTransactionGroupObserver → 级联软删
+        }
+    }
+    $journal->delete();          // 软删除
+}
+```
+
+**清理范围的精确评估**：
+
+| 被清理的数据 | 清理机制 | 是否彻底 |
+|------------|---------|---------|
+| `transaction_journals` | 软删除（`deleted_at` 非空） | ⚠️ 记录仍存在，但余额计算排除 |
+| `transactions` | 依赖外键级联或 observer？**均无显式清理** | ⚠️ 但 journal 软删除后，余额查询 JOIN `transaction_journals` 时 `WHERE deleted_at IS NULL` 排除了这些 transactions |
+| `transaction_groups` | 若 group 为空则 `delete()`，触发 observer | ✅ group 被清理 |
+| `journal_meta` | **无显式清理** | ❌ 残留在 DB 中（journal_id 仍指向已软删除的 journal） |
+| `budget_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
+| `category_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
+| `notes` | **无显式清理** | ❌ Note 记录残留 |
+| `tag_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
+| `locations` | **无显式清理** | ❌ Location 记录残留 |
+| `piggy_bank_events` | **无显式清理** | ❌ 事件记录残留 |
+
+**关键发现**：
+
+1. `$journal->delete()` 是**软删除**（`SoftDeletes` trait），不是物理删除。已软删除的 journal 在余额查询中被排除，所以**对余额计算无影响**
+2. 但子表数据（meta、pivot、notes、locations 等）**全部残留**在 DB 中，成为"软孤儿"
+3. 这些软孤儿不会影响功能正确性（因为关联查询都会 JOIN journal 并过滤 `deleted_at`），但会：
+   - 占用存储空间
+   - 在直接 SQL 查询或数据导出时产生困惑
+   - 在 journal 被恢复（`restore()`）时自动重新关联
+
+4. **forceDeleteOnError 的调用时机极其有限**：仅在 P6/P7 的 `catch (FireflyException $e)` 中被调用（见 10.6.2 节）。P8-P15 和 G2-G3 失败时**完全不会触发此清理逻辑**
+
+#### 10.6.6 补偿交易创建失败场景的完整残留矩阵（修正版）
+
+以下矩阵基于对账场景的实际代码路径，精确标注每个阶段失败后各数据表的状态：
+
+| 失败阶段 | 异常类型 | 被 catch? | transaction_journals | transactions | journal_meta | pivot(budget/category/tag) | notes | locations | transaction_groups | STEP 1 对账标记 | 用户看到 |
+|---------|---------|----------|---------------------|-------------|-------------|---------------------------|-------|-----------|-------------------|----------------|---------|
+| P1~P4 | FireflyException | ✅ journal 层 catch | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
+| P5 | QueryException → FireflyException | ✅ journal 层 catch | ❌ 无（被 forceDelete 清理） | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
+| P6~P7 | FireflyException | ✅ journal 层 catch + 清理 | ❌ 无（被清理） | ❌ 无（被清理） | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
+| P6~P7 | 非 FireflyException | ❌ 漏捕获 | ✅ 1 条(group_id=null) | ✅ 2 条 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| P8 | QueryException | ❌ 漏捕获 | ✅ 1 条(group_id=null) | ✅ 2 条 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| P9 | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ❌ 无 | ⚠️ budgets sync 已执行 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| P10 | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ❌ 无 | ⚠️ budgets+categories sync 已执行 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| P14 (meta) | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ⚠️ 部分（import_hash_v2 可能已写入） | ✅ P9-P10 已 sync | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| G2 | QueryException | ❌ 无 catch | ✅ 1 条(group_id=null) | ✅ 2 条 | ✅ 已写入 | ✅ 已 sync | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
+| G3 | QueryException | ❌ 无 catch | ✅ 1 条(group_id=?) | ✅ 2 条 | ✅ 已写入 | ✅ 已 sync | ❌ 无 | ❌ 无 | ✅ 1 条(可能) | ✅ 已标记 | 500 + 可能部分关联 |
+
+**最严重的一致性问题**：
+1. 无论 STEP 2 在哪一步失败，STEP 1 的对账标记都**已经持久化**，且永远不会被回滚
+2. P8-P15 和 G2/G3 失败产生的"孤儿 journal"（`transaction_group_id = null`）**不影响余额但不可见于 UI**，是最难发现的数据不一致
+3. P14 失败若导致 `import_hash_v2` 未写入，该 journal 将**永远不参与重复交易检测**，增加了重复创建的风险
+
 ---
 
 ## 十一、提交数据来源与服务端重算策略分析
