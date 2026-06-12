@@ -560,7 +560,572 @@ $this->app->bind(static function (Application $app): RuleEngineInterface {
 
 ---
 
-## 十、参考文件清单
+## 十、交易上下文挂入查询条件的机制
+
+### 10.1 问题背景
+
+当同一组条件需要反复应用到不同交易上时（例如用户刚创建了10条交易，需要逐条跑规则），规则引擎如何确保每条规则只针对**当前目标交易**进行匹配，而不是误匹配到其他交易？
+
+答案是：通过 **`addOperator` 机制注入 `journal_id` 限定条件**，将全局搜索缩小为单条交易范围的匹配。
+
+### 10.2 完整链路追踪
+
+#### 阶段一：事件监听器发起调用
+
+入口：[SupportsGroupProcessingTrait::processRules()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php#L29-L66)
+
+```php
+protected function processRules(Collection $set, string $type): void
+{
+    // ... 收集 journal_ids
+    
+    // 对每条交易，循环调用规则引擎
+    foreach ($array as $journalId) {
+        Log::debug(sprintf('Fire rule engine for journal #%d', $journalId));
+        
+        // 关键1：先清除旧的 journal_id，防止上下文污染
+        $newRuleEngine->removeOperator('journal_id');
+        
+        // 关键2：注入当前交易的 ID 作为限定条件
+        $newRuleEngine->addOperator(['type' => 'journal_id', 'value' => $journalId]);
+        
+        // 关键3：执行规则（所有条件都会叠加这个 journal_id 过滤）
+        $newRuleEngine->fire();
+    }
+}
+```
+
+**循环策略**：
+- 多条交易不是一次性批量传入，而是**逐条循环调用引擎**
+- 每次循环前先 `removeOperator('journal_id')` 清除上一条的上下文
+- 再 `addOperator()` 注入当前交易的 ID，确保引擎每次只"看见"一条交易
+
+#### 阶段二：SearchRuleEngine 内部持有 operators
+
+定义：[SearchRuleEngine.php L53](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L53)
+
+```php
+// 私有成员变量，存储所有外部注入的"附加查询条件"
+private array $operators = [];
+```
+
+注入方法：[addOperator()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L66-L70)
+
+```php
+public function addOperator(array $operator): void
+{
+    // 格式：['type' => 'journal_id', 'value' => '123']
+    $this->operators[] = $operator;
+}
+```
+
+清除方法：[removeOperator()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L142-L154)
+
+```php
+public function removeOperator(string $type): void
+{
+    // 按 type 过滤掉，防止不同交易之间的 ID 串台
+    $new = [];
+    foreach ($this->operators as $operator) {
+        if ($type === $operator['type']) {
+            continue;  // 跳过指定 type 的操作符
+        }
+        $new[] = $operator;
+    }
+    $this->operators = $new;
+}
+```
+
+#### 阶段三：构建查询时叠加注入的操作符
+
+##### 非严格模式下的挂入
+
+代码位置：[findNonStrictRule() L251-L255](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L251-L255)
+
+```php
+// 1. 先构建规则自身定义的触发器条件
+$searchArray = [];
+$searchArray[$ruleTrigger->trigger_type] = sprintf('"%s"', $ruleTrigger->trigger_value);
+
+// 2. ★ 关键：再把外部注入的 operators（如 journal_id）也追加进去
+foreach ($this->operators as $operator) {
+    Log::debug(sprintf('SearchRuleEngine:: add local added operator: %s:"%s"', $operator['type'], $operator['value']));
+    $searchArray[$operator['type']] = sprintf('"%s"', $operator['value']);
+}
+
+// 3. 组合后的 searchArray 交给搜索引擎
+//    例如最终变成：description_is:"超市" AND journal_id:"123"
+```
+
+##### 严格模式下的挂入
+
+代码位置：[findStrictRule() L338-L341](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L338-L341)
+
+```php
+// 1. 先收集所有触发器（AND 组合）
+foreach ($triggers as $ruleTrigger) {
+    $searchArray[$ruleTrigger->trigger_type][] = sprintf('"%s"', $ruleTrigger->trigger_value);
+}
+
+// 2. ★ 关键：同样追加注入的 operators（注意是数组形式，因为严格模式下允许多值）
+foreach ($this->operators as $operator) {
+    $searchArray[$operator['type']][] = sprintf('"%s"', $operator['value']);
+}
+```
+
+**差异说明**：
+- 非严格模式：`$searchArray[$type] = $value`（每个触发器独立一次搜索）
+- 严格模式：`$searchArray[$type][] = $value`（所有触发器攒成数组，统一搜索）
+- 但无论哪种，**注入的 operators 都会被合并到最终的查询条件中**
+
+#### 阶段四：OperatorQuerySearch 解析 journal_id 操作符
+
+代码位置：[OperatorQuerySearch::updateCollector() L1497-L1501](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php#L1497-L1501)
+
+```php
+case 'journal_id':
+    $parts = explode(',', $value);
+    // 调用 GroupCollector 的 setJournalIds 方法，最终落地为 SQL whereIn
+    $this->collector->setJournalIds($parts);
+    break;
+```
+
+#### 阶段五：GroupCollector 落地为 SQL 条件
+
+代码位置：[GroupCollector::setJournalIds()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Helpers/Collector/GroupCollector.php#L540-L551)
+
+```php
+public function setJournalIds(array $journalIds): GroupCollectorInterface
+{
+    if (0 !== count($journalIds)) {
+        $integerIDs = array_map(intval(...), $journalIds);
+        
+        // ★ 最终落地为 SQL 的 WHERE IN 条件
+        $this->query->whereIn('transaction_journals.id', $integerIDs);
+    }
+    return $this;
+}
+```
+
+### 10.3 上下文挂入的完整数据流图
+
+```
+用户创建/更新交易
+    │
+    ▼
+触发 CreatedSingleTransactionGroup / UpdatedSingleTransactionGroup 事件
+    │
+    ▼
+ProcessesNewTransactionGroup::handle()
+    │ 调用 $this->processRules($journals, 'store-journal')
+    ▼
+SupportsGroupProcessingTrait::processRules()
+    │
+    ├── 加载所有规则组（同一组条件集合）
+    │
+    └── 对每条交易循环：
+         ├─ removeOperator('journal_id')  ← 清空前一条交易的 ID
+         ├─ addOperator(['journal_id' => $id])  ← 注入当前交易 ID
+         └─ fire()
+              │
+              ▼
+         SearchRuleEngine 构建 searchArray
+              │ + operators（包含 journal_id）
+              ▼
+         OperatorQuerySearch::updateCollector()
+              │ case 'journal_id': setJournalIds()
+              ▼
+         GroupCollector::whereIn('transaction_journals.id', [$id])
+              │
+              ▼
+         SQL 查询：SELECT ... WHERE ... AND transaction_journals.id IN (123)
+              │
+              ▼
+         只返回当前这一条交易（如果满足规则自身条件）→ 执行动作
+```
+
+### 10.4 关键设计要点
+
+| 设计点 | 说明 |
+|--------|------|
+| **逐条循环而非批量** | 每条交易独立调用 `fire()`，保证规则层 `stop_processing` 等语义正确 |
+| **先清除后注入** | 每次循环先 `removeOperator` 再 `addOperator`，防止 ID 残留 |
+| **同一套规则组复用** | 规则引擎实例只创建一次，`$groups` 不变，仅通过 `operators` 切换目标交易 |
+| **落地为 WHERE IN** | 最终由 GroupCollector 通过 `whereIn('id', [$id])` 精确限定范围 |
+| **对规则透明** | 规则定义者完全感知不到这个机制，所有条件的写法与全局搜索一致 |
+
+---
+
+## 十一、动作生效后避免重复触发的机制
+
+### 11.1 问题背景
+
+规则引擎修改交易后（例如把交易 A 分类为"餐饮"），这个**修改动作本身**也会触发数据库的 Model 事件（如 `updated`），如果不加防护就会：
+
+1. 修改交易 → 触发 `UpdatedSingleTransactionGroup` 事件
+2. 事件监听器再次调用 `processRules()`
+3. 交易再次被规则引擎扫描，又匹配到相同规则
+4. **无限循环 / 重复执行**
+
+Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链路中切断重复触发。
+
+### 11.2 核心角色：TransactionGroupEventFlags
+
+定义文件：[TransactionGroupEventFlags.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php)
+
+```php
+class TransactionGroupEventFlags
+{
+    // ★ 关键：默认是 true，表示"应当执行规则"
+    public bool $applyRules        = true;
+    
+    public bool $fireWebhooks      = true;
+    public bool $batchSubmission   = false;
+    public bool $recalculateCredit = true;
+    public bool $unifyOnly         = false;
+}
+```
+
+这是一个简单的 DTO（数据传输对象），作为**参数**随事件对象一起传递给监听器。监听器在处理前会先检查 `flags->applyRules` 的值。
+
+### 11.3 完整防循环链路
+
+#### 第一层：规则引擎在 fire 时主动置 false
+
+在 [fireStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L449-L477) 和 [fireNonStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L402-L419) 中：
+
+```php
+private function fireStrictRule(Rule $rule): bool
+{
+    // ★ 步骤1：创建 flags，并主动把 applyRules 置为 false！
+    $flags               = new TransactionGroupEventFlags();
+    $flags->applyRules   = false;   // ← 关键：告诉后续监听器不要再跑规则
+    $flags->fireWebhooks = false;   // 同时也不触发 Webhook（副作用收敛）
+    
+    $objects             = new TransactionGroupEventObjects();
+    $collection          = $this->findStrictRule($rule);
+
+    // ★ 步骤2：执行动作，直接用 SQL 修改数据库（不走 Model save）
+    $this->processResults($rule, $collection);
+
+    // ★ 步骤3：触发更新事件，但传入的是 applyRules=false 的 flags！
+    $objects->collectFromCollection($collection);
+    event(new UpdatedSingleTransactionGroup($flags, $objects));
+    //                          ↑↑↑↑↑
+    //               带着 applyRules=false 广播事件
+    
+    return $collection->count() > 0;
+}
+```
+
+**非严格模式完全一致**：
+```php
+private function fireNonStrictRule(Rule $rule): bool
+{
+    $flags               = new TransactionGroupEventFlags();
+    $flags->applyRules   = false;   // 同样置 false
+    $flags->fireWebhooks = false;
+    // ...
+    event(new UpdatedSingleTransactionGroup($flags, $objects));
+}
+```
+
+#### 第二层：监听器接收到事件后检查 flags
+
+在 [ProcessesUpdatedTransactionGroup::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php#L40-L75)：
+
+```php
+public function handle(UpdatedSingleTransactionGroup $event): void
+{
+    // ★ 步骤A：检查 flags 开关，若为 false 则跳过规则处理
+    if (!$event->flags->applyRules) {
+        Log::debug(sprintf('Will NOT process rules for %d journal(s)', 
+            $event->objects->transactionJournals->count()));
+        // ↑↑↑ 打日志后跳过 processRules()
+    }
+    
+    // 其他清理工作（如重算余额、删统计缓存）仍然会执行
+    
+    // ★ 步骤B：只有 applyRules=true 时才执行 processRules
+    if ($event->flags->applyRules) {
+        $this->processRules($event->objects->transactionJournals, 'update-journal');
+    }
+    
+    // 下面的工作照常进行（不受 applyRules 影响）：
+    if ($event->flags->recalculateCredit) { /* 重算信用 */ }
+    if ($event->flags->fireWebhooks)     { /* 触发 Webhook */ }
+    $this->removePeriodStatistics($event->objects);
+    $this->recalculateRunningBalance($event->objects);
+}
+```
+
+同理，[ProcessesNewTransactionGroup::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php#L53-L65) 也是完全同样的判断逻辑。
+
+### 11.4 防循环时序图
+
+```
+用户手动更新交易
+    │
+    ├─ 构造事件: flags.applyRules = true（默认）
+    └─ 广播 UpdatedSingleTransactionGroup(flags=true)
+           │
+           ▼
+    ProcessesUpdatedTransactionGroup 收到事件
+           │ flags.applyRules = true ✓
+           ▼
+    调用 processRules() 启动规则引擎
+           │
+           ▼
+    SearchRuleEngine::fireStrictRule()
+           │
+           ├─ ① 创建新 flags: applyRules = false ✗
+           ├─ ② processResults() → 动作用 SQL 修改 DB（SET category=X）
+           │        ↑ 直接 DB 操作，不走 Model 事件
+           │
+           └─ ③ 广播 UpdatedSingleTransactionGroup(flags=false ✗)
+                    │
+                    ▼
+              ProcessesUpdatedTransactionGroup 再次收到事件
+                    │ flags.applyRules = false ✗
+                    ▼
+              ★ 不会再调用 processRules()！循环被切断！
+              
+              仍然会执行：
+              ├─ recalculateCredit（重算信用）
+              ├─ removePeriodStatistics（清统计缓存）
+              └─ recalculateRunningBalance（重算余额）
+```
+
+### 11.5 辅助防线：动作层的幂等性设计
+
+除了 flags 机制外，每个动作实现也都有**幂等检查**，构成第二道防线：
+
+以 [SetCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L86-L90) 为例：
+
+```php
+// 检查旧分类是否与新分类相同
+if ((int)$oldCategory?->id === $category->id) {
+    // 已经是目标分类，返回 false 表示"未修改"
+    return false;
+}
+```
+
+所有动作都有类似逻辑：
+- [SetDescription.php]()：比较 before/after 字符串是否相同
+- [SetDestinationAccount.php]()：比较旧账户ID与新账户ID
+- [AddTag.php]()：检查标签是否已存在
+
+**双重保险**：
+1. **第一道（flags）**：从事件源头上不让规则引擎被二次调用
+2. **第二道（幂等）**：即使被调用了，动作层也不会重复修改
+
+### 11.6 不同动作触发方式的对比
+
+| 触发场景 | applyRules 初始值 | 是否二次触发事件 | 是否重复执行规则 |
+|----------|-------------------|------------------|------------------|
+| 用户创建交易 | true（默认） | 是（动作广播事件） | **否**（动作广播时设为 false） |
+| 用户更新交易 | true（默认） | 是（动作广播事件） | **否**（同上） |
+| 规则引擎动作修改 | **false**（引擎显式设置） | 是（动作广播事件） | **否**（监听器判断为 false） |
+| 控制台命令手动触发 | 取决于命令参数 | 视命令实现而定 | 通常命令自己控制循环 |
+
+### 11.7 关键设计要点
+
+1. **事件参数透传而非全局状态**：`applyRules` 不存 Session 或静态变量，而是作为事件对象的字段传递，天然线程安全
+2. **主动置 false 而非默认跳过**：规则引擎在自己触发事件前**主动**把标志设为 false，语义明确
+3. **只阻断规则，不阻断其他流程**：清缓存、重算余额等清理工作仍然执行，避免了跳过规则导致的数据不一致
+4. **两道防线纵深防御**：flags 机制（第一道）+ 动作幂等（第二道），确保在各种边界情况下都不会出现死循环
+
+---
+
+## 十二、匹配顺序（Order）的完整应用
+
+### 12.1 Order 是整个链路的核心排序键
+
+从规则组加载到动作执行的每一层，`order` 字段都决定了"谁先谁后"。这也是冲突选优（第六章）的物理基础。
+
+### 12.2 四层 Order 在 DB 查询时的应用
+
+所有层的排序都在 **Repository 层加载数据时** 通过 SQL `ORDER BY` 完成，确保内存中集合顺序就是执行顺序。
+
+#### 第 1 层：规则组的 order
+
+代码位置：[RuleGroupRepository::getRuleGroupsWithRules()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L220-L236)
+
+```php
+$groups = $this->user
+    ->ruleGroups()
+    ->orderBy('order', 'ASC')       // ← 规则组按 order 正序
+    ->where('active', true)
+    ->with([...])                   // 同时预加载子级数据
+    ->get();
+```
+
+类似的加载点还有：
+- [getActiveGroups()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L126-L134) → `orderBy('order', 'ASC')`
+- [get()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L121-L124) → `orderBy('order', 'ASC')`
+
+#### 第 2 层：规则的 order
+
+在同一个 `with()` 闭包中对子集排序：
+
+```php
+->with([
+    'rules' => static function (HasMany $query): void {
+        $query->orderBy('order', 'ASC');       // ← 组内规则按 order 正序
+        $query->where('rules.active', true);
+    },
+```
+
+如果规则组没有使用 `with()` 预加载，SearchRuleEngine 内部也会重新加载时排序：
+
+[fireGroup() L378-L381](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L378-L381)：
+```php
+$rules = $group
+    ->rules()
+    ->orderBy('rules.order', 'ASC')      // ← 再次保证 order 正序
+    ->where('rules.active', true)
+    ->get(['rules.*']);
+```
+
+#### 第 3 层：触发器的 order
+
+同样在 Repository 的 `with()` 中定义：
+
+```php
+'rules.ruleTriggers' => static function (HasMany $query): void {
+    $query->orderBy('order', 'ASC');        // ← 触发器按 order 正序
+},
+```
+
+SearchRuleEngine 内部加载时也排序：
+
+[findNonStrictRule() L213](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L213)：
+```php
+$triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
+```
+
+[findStrictRule() L309](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L309)：
+```php
+$triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
+```
+
+#### 第 4 层：动作的 order
+
+在 Repository 的 `with()` 中定义：
+
+```php
+'rules.ruleActions' => static function (HasMany $query): void {
+    $query->orderBy('order', 'ASC');        // ← 动作按 order 正序
+},
+```
+
+SearchRuleEngine 内部执行时同样排序：
+
+[processTransactionJournal() L577](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L577)：
+```php
+$actions = $rule->ruleActions()->orderBy('order', 'ASC')->get();
+```
+
+### 12.3 Order 在循环执行时的实际效果
+
+以一条包含 3 个规则组的完整链路为例：
+
+```
+SQL 查询层（ORDER BY order ASC 已排好）
+    │
+    ▼
+内存中拿到的 Collection
+    │
+    ▼
+RuleGroup(order=1) "默认规则组"
+    │
+    ├─ Rule(order=1) "超市消费"
+    │    ├─ RuleTrigger(order=1): description_contains "永辉"
+    │    ├─ RuleTrigger(order=2): source_account_is "招行卡"
+    │    └─ RuleAction(order=1): set_category "餐饮"
+    │         RuleAction(order=2): add_tag "日常消费"
+    │         RuleAction(order=3, stop_processing=true): set_budget "伙食费" ← 最后一个并中断
+    │
+    ├─ Rule(order=2, stop_processing=true) "大额转账" ← 如果触发，组内不再往下
+    │    └─ ...
+    │
+    └─ Rule(order=3) "工资收入"（可能因 Rule#2 触发而永远执行不到）
+         └─ ...
+    │
+RuleGroup(order=2) "高级规则组"
+    └─ ...
+    │
+RuleGroup(order=3) "清理规则组"
+    └─ ...
+```
+
+**执行顺序严格等于 order 升序**：
+1. 第 1 层：按 rule_group.order 从小到大遍历组
+2. 第 2 层：按 rule.order 从小到大遍历组内规则（触发且 stop_processing=true 则跳出）
+3. 第 3 层：按 trigger.order 从小到大尝试匹配（非严格模式下支持提前中断）
+4. 第 4 层：按 action.order 从小到大执行动作（修改成功且 stop_processing=true 则跳出）
+
+### 12.4 Order 的维护
+
+RuleGroupRepository 提供了重排方法：[correctRuleGroupOrder()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L44-L69)
+
+```php
+public function correctRuleGroupOrder(): void
+{
+    $set = $this->user
+        ->ruleGroups()
+        ->orderBy('order', 'ASC')    // 先按当前 order 取出
+        ->orderBy('active', 'DESC')  // 激活的排前面
+        ->orderBy('title', 'ASC')    // 再按标题
+        ->get(['rule_groups.id']);
+    
+    $index = 1;
+    foreach ($set as $item) {
+        RuleGroup::where('id', $item->id)->update(['order' => $index++]);
+        // 重新写入连续的 order 值
+    }
+}
+```
+
+### 12.5 Order 与 stop_processing 的配合
+
+`order` 决定**顺序**，`stop_processing` 决定**是否中断**，两者组合实现完整的控制流：
+
+| 场景 | order 作用 | stop_processing 作用 |
+|------|-----------|----------------------|
+| 优先级高的规则先匹配 | 把常用规则设为 order=1 | 匹配后设为 true，避免浪费计算 |
+| "兜底"规则最后执行 | 设为最大 order 值 | 设为 false，前面的先跑完 |
+| 条件匹配时找到就停 | 先写命中率高的 trigger（非严格） | trigger 设为 true，停止尝试其他条件 |
+| 动作链中修改完即止 | 最核心的 action 放最前 | action 设为 true，避免后续覆盖 |
+
+---
+
+## 十三、参考文件清单（扩展）
+
+| 文件路径 | 说明 |
+|----------|------|
+| [app/TransactionRules/Engine/SearchRuleEngine.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php) | 规则引擎核心实现（含 addOperator/removeOperator/fireStrictRule/fireNonStrictRule） |
+| [app/TransactionRules/Engine/RuleEngineInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/RuleEngineInterface.php) | 规则引擎接口 |
+| [app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php) | processRules() 循环注入 journal_id 的入口 |
+| [app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php) | 新交易事件监听器（检查 flags） |
+| [app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php) | 更新交易事件监听器（检查 flags） |
+| [app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php) | 事件标志位（applyRules/fireWebhooks 等） |
+| [app/Repositories/RuleGroup/RuleGroupRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php) | 规则组仓库（含四层 ORDER BY） |
+| [app/Models/Rule.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/Rule.php) | 规则模型 |
+| [app/Models/RuleGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleGroup.php) | 规则组模型 |
+| [app/Models/RuleTrigger.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleTrigger.php) | 触发器模型 |
+| [app/Models/RuleAction.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleAction.php) | 动作模型 |
+| [app/TransactionRules/Factory/ActionFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Factory/ActionFactory.php) | 动作工厂 |
+| [app/TransactionRules/Actions/ActionInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ActionInterface.php) | 动作接口 |
+| [app/TransactionRules/Actions/SetCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php) | 动作示例（含幂等检查） |
+| [app/Support/Search/OperatorQuerySearch.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php) | 搜索实现（journal_id case） |
+| [app/Helpers/Collector/GroupCollector.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Helpers/Collector/GroupCollector.php) | 查询收集器（setJournalIds → whereIn） |
+| [config/search.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/search.php) | 搜索操作符配置 |
+| [config/firefly.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/firefly.php) | 动作类型配置 |
+
+---
+
+## 十四、参考文件清单
 
 | 文件路径 | 说明 |
 |----------|------|
