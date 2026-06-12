@@ -760,14 +760,118 @@ SupportsGroupProcessingTrait::processRules()
 
 ### 11.1 问题背景
 
-规则引擎修改交易后（例如把交易 A 分类为"餐饮"），这个**修改动作本身**也会触发数据库的 Model 事件（如 `updated`），如果不加防护就会：
+规则引擎修改交易后（例如把交易 A 分类为"餐饮"），**规则引擎自己需要再次广播 `UpdatedSingleTransactionGroup` 事件**来触发后续的清理工作（重算余额、清统计缓存、触发 Webhook 等）。但如果不加防护，这条广播又会让监听器把规则引擎重新跑一遍，就会：
 
-1. 修改交易 → 触发 `UpdatedSingleTransactionGroup` 事件
-2. 事件监听器再次调用 `processRules()`
-3. 交易再次被规则引擎扫描，又匹配到相同规则
+1. 规则引擎执行完动作 → **引擎自己在末尾显式**广播 `UpdatedSingleTransactionGroup`
+2. `ProcessesUpdatedTransactionGroup` 监听器收到事件 → 再次调用 `processRules()`
+3. 交易再次被规则引擎扫描，又匹配到相同规则 → 又广播一次事件
 4. **无限循环 / 重复执行**
 
 Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链路中切断重复触发。
+
+#### 两个需要先讲准的关键事实
+
+##### 事实一：`UpdatedSingleTransactionGroup` 是业务层手动广播的，不是 Eloquent Model 事件自动触发的
+
+在整个代码库里，该事件共被显式 `event(new UpdatedSingleTransactionGroup(...))` 广播了 **9 处**，主要来源：
+
+| 广播位置 | 场景 | applyRules 默认值 |
+|----------|------|-------------------|
+| [SearchRuleEngine::fireStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L466) | 规则引擎严格模式执行完 | **false**（引擎显式设置） |
+| [SearchRuleEngine::fireNonStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L415) | 规则引擎非严格模式执行完 | **false**（引擎显式设置） |
+| [TransactionGroupRepository::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L365) | 用户新建交易（发出 `CreatedSingleTransactionGroup`） | `$data['apply_rules'] ?? true` |
+| [AccountServiceTrait](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Services/Internal/Support/AccountServiceTrait.php) | 账户服务内部变更 | **false** |
+| [MassController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/MassController.php) | 批量编辑 | true（默认构造） |
+| [ConvertController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/ConvertController.php) | 转换交易类型 | true（默认构造） |
+| [BulkController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/BulkController.php) | 批量操作 | 取决于请求参数 |
+| [CorrectsGroupAccounts](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Console/Commands/Correction/CorrectsGroupAccounts.php) | 修复命令 | **false** |
+| [UpdateController (API)](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php) | API 更新交易 | 取决于请求参数 |
+
+`UpdatedSingleTransactionGroup` **不跟 Eloquent ORM 的 `saving` / `saved` / `updating` / `updated` 事件挂钩**——它完全是业务层自己控制什么时候发。`TransactionGroup` 模型上唯一注册的 Observer 是 [DeletedTransactionGroupObserver](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Handlers/Observer/DeletedTransactionGroupObserver.php)，只监听 `deleting`，与更新事件无关。
+
+##### 事实二：动作本身不会直接触发 `UpdatedSingleTransactionGroup`
+
+动作修改数据库分两种写法，但**无论哪种都不会直接产生 `UpdatedSingleTransactionGroup` 事件**：
+
+**写法 A（绝大多数动作）：`DB::table()->update/insert/delete`**
+
+例如：
+- [SetCategory L92-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L92-L96)：`DB::table('category_transaction_journal')->...`
+- [SetDescription L64](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php#L64)：`DB::table('transaction_journals')->where('id', ...)->update(...)`
+- [SetBudget L98-L102](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetBudget.php#L98-L102)
+- [SetDestinationAccount L127](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php#L127)
+- [ConvertToWithdrawal L166-L173](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ConvertToWithdrawal.php#L166-L173)
+
+`DB::table()` 走的是 Laravel Query Builder，**绕开 Eloquent ORM**，所以：
+- ❌ 不会触发任何 Model 事件（`saving`、`saved`、`updating`、`updated`）
+- ❌ 自然不会广播 `UpdatedSingleTransactionGroup`
+
+**写法 B（少数动作）：Eloquent Model 的 `->save()`**
+
+目前代码中只有 3 个动作使用了 `->save()`：
+
+- [SetNotes L56](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetNotes.php#L56)：`$dbNote->save()`（操作 Note 模型）
+- [SwitchAccounts L97-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SwitchAccounts.php#L97-L98)：`$sourceTransaction->save()` 和 `$destTransaction->save()`（操作 Transaction 模型）
+- [SetAmount L106](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetAmount.php#L106)：`$transaction->save()` + `$object->transactionGroup->touch()`
+
+这些 `->save()` **会触发对应 Model 的 Observer**，但 Observer 里只做本位币金额换算等数据维护工作，**完全不会广播 `UpdatedSingleTransactionGroup`**。也就是说，即使动作用了 Eloquent 写法，也不会间接引发规则引擎的二次执行。
+
+所以结论是：
+- ✅ `UpdatedSingleTransactionGroup` 只来自业务层显式的 `event(...)` 调用
+- ✅ 动作执行完后这条事件是 **SearchRuleEngine 自己在 fireStrictRule / fireNonStrictRule 的末尾主动发出来的**
+- ✅ 发的时候 `flags->applyRules` 已经被设为 `false`
+
+**两个需要先讲准的关键事实**：
+
+#### 事实一：`UpdatedSingleTransactionGroup` 是业务层手动广播的，不是 Eloquent Model 事件自动触发的
+
+在整个代码库里，该事件共被显式 `event(new UpdatedSingleTransactionGroup(...))` 广播了 **9 处**，主要来源：
+
+| 广播位置 | 场景 | applyRules 默认值 |
+|----------|------|-------------------|
+| [SearchRuleEngine::fireStrictRule() L466](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L466) | 规则引擎严格模式执行完 | **false**（引擎显式设置） |
+| [SearchRuleEngine::fireNonStrictRule() L415](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L415) | 规则引擎非严格模式执行完 | **false**（引擎显式设置） |
+| [TransactionGroupRepository::store() L368](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L368) | 用户新建交易（这是 `CreatedSingleTransactionGroup`） | `$data['apply_rules'] ?? true` |
+| [AccountServiceTrait L675](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Services/Internal/Support/AccountServiceTrait.php#L675) | 账户服务内部变更 | **false** |
+| [MassController L282](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/MassController.php#L282) | 批量编辑 | true（默认构造） |
+| [ConvertController L170](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/ConvertController.php#L170) | 转换交易类型 | true（默认构造） |
+| [BulkController L124](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/BulkController.php#L124) | 批量操作 | 取决于请求参数 |
+| [CorrectsGroupAccounts L71](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Console/Commands/Correction/CorrectsGroupAccounts.php#L71) | 修复命令 | **false** |
+| [UpdateController (API) L97](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php#L97) | API 更新交易 | 取决于请求参数 `applyRules` |
+
+`UpdatedSingleTransactionGroup` **不跟 Eloquent ORM 的 `saving` / `saved` / `updating` / `updated` 事件挂钩**——它完全是业务层自己控制什么时候发。
+
+#### 事实二：动作本身不会直接触发 `UpdatedSingleTransactionGroup`
+
+动作修改数据库分两种写法，但**无论哪种都不会直接产生 `UpdatedSingleTransactionGroup` 事件**：
+
+**写法 A（绝大多数动作）：`DB::table()->update/insert/delete`**
+
+例如：
+- [SetCategory L92-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L92-L96)：`DB::table('category_transaction_journal')->...`
+- [SetDescription L64](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php#L64)：`DB::table('transaction_journals')->where('id', ...)->update(...)`
+- [SetBudget L98-L102](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetBudget.php#L98-L102)
+- [SetDestinationAccount L127](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php#L127)
+- [ConvertToWithdrawal L166-L173](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ConvertToWithdrawal.php#L166-L173)
+
+`DB::table()` 走的是 Laravel Query Builder，**绕开 Eloquent ORM**，所以：
+- ❌ 不会触发任何 Model 事件（`saving`、`saved`、`updating`、`updated`）
+- ❌ 自然不会广播 `UpdatedSingleTransactionGroup`
+
+**写法 B（少数动作）：Eloquent Model 的 `->save()`**
+
+目前代码中只有 3 个动作使用了 `->save()`：
+
+- [SetNotes L56](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetNotes.php#L56)：`$dbNote->save()`（操作 Note 模型）
+- [SwitchAccounts L97-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SwitchAccounts.php#L97-L98)：`$sourceTransaction->save()` 和 `$destTransaction->save()`（操作 Transaction 模型）
+- [PrependNotes L62](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/PrependNotes.php)、[AppendNotes L65](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/AppendNotes.php)：操作 Note 模型
+
+这些 `->save()` **会触发对应 Model 的 Observer**（例如 Transaction 模型通过 `#[ObservedBy([TransactionObserver::class])]` 注册了观察者）。但 [TransactionObserver::updated()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Handlers/Observer/TransactionObserver.php#L44-L47) 只做一件事——把金额换算成本位币金额（`updatePrimaryCurrencyAmount`），**完全不会广播 `UpdatedSingleTransactionGroup`**。
+
+所以结论是：
+- ✅ `UpdatedSingleTransactionGroup` 只来自业务层显式的 `event(...)` 调用
+- ✅ 动作执行完后这条事件是 **SearchRuleEngine 自己在 fireStrictRule / fireNonStrictRule 的末尾主动发出来的**
+- ✅ 发的时候 `flags->applyRules` 已经被设为 `false`
 
 ### 11.2 核心角色：TransactionGroupEventFlags
 
@@ -911,9 +1015,9 @@ if ((int)$oldCategory?->id === $category->id) {
 ```
 
 所有动作都有类似逻辑：
-- [SetDescription.php]()：比较 before/after 字符串是否相同
-- [SetDestinationAccount.php]()：比较旧账户ID与新账户ID
-- [AddTag.php]()：检查标签是否已存在
+- [SetDescription.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php)：比较 before/after 字符串是否相同
+- [SetDestinationAccount.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php)：比较旧账户ID与新账户ID
+- [AddTag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/AddTag.php)：检查标签是否已存在
 
 **双重保险**：
 1. **第一道（flags）**：从事件源头上不让规则引擎被二次调用
