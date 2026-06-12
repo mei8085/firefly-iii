@@ -396,3 +396,380 @@ Firefly III 严格遵循**会计不可变性原则**：
 - 日期：对账期间的结束日 `$end->endOfDay()`
 - 对账标记：自身立即 `reconciled=true`，避免下次重复对账
 - 可追溯：作为独立交易存在，可在交易列表中筛选查看，可单独删除但不影响原交易
+
+---
+
+## 十、提交阶段事务控制与回滚机制深度分析
+
+### 10.1 submit() 方法的执行顺序与无事务特征
+
+重新审视 [ReconcileController::submit()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L169-L204) 的完整控制流：
+
+```php
+public function submit(ReconciliationStoreRequest $request, Account $account, Carbon $start, Carbon $end): RedirectResponse
+{
+    Log::debug('In ReconcileController::submit()');
+    $data = $request->getAll();
+
+    // ═══════════════════════════════════════════════════════════
+    // STEP 1: 逐条标记交易（每条 UPDATE 立即生效，无法回滚）
+    // ═══════════════════════════════════════════════════════════
+    foreach ($data['journals'] as $journalId) {
+        $this->repository->reconcileById((int) $journalId);
+    }
+    Log::debug('Reconciled all transactions.');
+
+    // 日期校正
+    if ($end->lt($start)) {
+        [$start, $end] = [$end, $start];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STEP 2: 创建补偿交易（可能失败）
+    // ═══════════════════════════════════════════════════════════
+    $result = '';
+    if ('create' === $data['reconcile']) {
+        $result = $this->createReconciliation($account, $start, $end, $data['difference']);
+    }
+
+    // 结果反馈（无论 STEP 2 是否成功，STEP 1 的修改都已持久化）
+    if ('' === $result) {
+        session()->flash('success', (string) trans('firefly.reconciliation_stored'));
+    }
+    if ('' !== $result) {
+        session()->flash('error', (string) trans('firefly.reconciliation_error', ['error' => $result]));
+    }
+
+    return redirect(route('accounts.show', [$account->id]));
+}
+```
+
+**代码层验证无事务**：
+
+1. 无数据库事务包装：`ReconcileController` 继承的基础 [Controller.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Controller.php) 中**没有**任何 `DB::transaction()`、`DB::beginTransaction()`、`DB::commit()`、`DB::rollback()` 调用。
+2. [ReconcileController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php) 自身也**不包含**任何事务相关代码。
+3. 每条 `reconcileById()` 在 MySQL InnoDB 中默认以 **auto-commit** 模式执行：一条 `UPDATE` 语句立即提交并持久化。
+
+### 10.2 createReconciliation() 的异常捕获与错误返回
+
+查看 [createReconciliation()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L211-L270) 的错误处理：
+
+```php
+private function createReconciliation(Account $account, Carbon $start, Carbon $end, string $difference): string
+{
+    // ...省略准备代码...
+
+    try {
+        $factory->create($submission);      // 可能抛出多种异常
+    } catch (FireflyException $e) {        // ⚠️ 只捕获 FireflyException！
+        return $e->getMessage();            // 返回错误字符串
+    }
+
+    return '';
+}
+```
+
+⚠️ **关键细节**：方法签名标注了 `@throws DuplicateTransactionException`，但 `try-catch` **仅捕获 `FireflyException`**。而 [DuplicateTransactionException](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Exceptions/DuplicateTransactionException.php) 继承自原生 `Exception`，**不是** `FireflyException` 的子类。
+
+### 10.3 各类失败场景的一致性状态矩阵
+
+| 场景 | STEP 1 标记 | STEP 2 补偿 | 数据库状态 | 结果 |
+|------|------------|------------|-----------|------|
+| ✅ 正常情况 | 全部完成 | 创建成功 | **一致** | 显示 success |
+| ❌ 场景A：`create()` 抛出 `FireflyException` | ✅ 已永久提交 | ❌ 未创建 | **不一致** ⚠️ | 显示 error，**标记已对账但余额未修正** |
+| ❌ 场景B：`create()` 抛出 `DuplicateTransactionException` | ✅ 已永久提交 | ❌ 未创建 | **不一致** ⚠️ + 崩溃 | Laravel 异常处理器捕获，报 500 错误，**用户看不到错误提示** |
+| ❌ 场景C：`create()` 抛出其他 `Exception`（DB、网络等） | ✅ 已永久提交 | ❌ 未创建 | **不一致** ⚠️ + 崩溃 | 500 错误，状态同上 |
+| ❌ 场景D：`reconcileById()` 中途某条抛异常（如 DB 连接断开） | ✅ 已循环到的已提交 | ❌ 未执行 | **部分不一致** ⚠️ | 500 错误，一部分交易已标记，另一部分未标记 |
+
+### 10.4 不一致状态的用户视角与后果
+
+以"场景A"为例（最可能的不一致情况，如账户验证失败等）：
+1. 用户提交对账 → flash 显示 `reconciliation_error` 提示
+2. 跳转回账户详情页
+3. **用户看到的现象**：
+   - 勾选的 N 条交易显示 "Reconciled" 对勾标记 ✅
+   - 账户余额**与银行实际余额仍不一致**（因为补偿交易未创建）
+   - 交易列表里**找不到**预期的"对账调节交易"记录
+4. **用户可能的错误操作**：
+   - 误以为提交失败，重新勾选同样的交易再次提交 → 重复标记（幂等无副作用，但差额还在）
+   - 手动"创建一条差异交易" → 可能金额/方向搞错，或者下次对账把这条也勾进去导致二次补偿
+   - 以为系统 bug，去反对账所有交易 → 大量手工操作
+
+### 10.5 TransactionJournalFactory 内部的局部事务（不影响外部）
+
+虽然 submit() 没有整体事务，但 [TransactionJournalFactory::createJournal()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php) 内部在补偿交易的创建过程中**自身有原子性保障**：
+
+```php
+// createJournal() 中，若创建源侧 Transaction 失败：
+} catch (FireflyException $e) {
+    $this->forceDeleteOnError(new Collection()->push($journal));  // 删除已创建的 journal
+    throw new FireflyException(...);
+}
+
+// 若创建目标侧 Transaction 失败：
+} catch (FireflyException $e) {
+    $this->forceTrDelete($negative);                           // 删除已创建的负侧 Transaction
+    $this->forceDeleteOnError(new Collection()->push($journal));  // 删除 journal
+    throw new FireflyException(...);
+}
+```
+
+调用链 `forceDeleteOnError()` → `JournalDestroyService::destroy()`，确保补偿交易创建到一半失败时**不会留下半个交易数据**。
+
+但这个局部保障**仅限于补偿交易内部**，不会回滚 submit() STEP 1 中已标记的对账流水。
+
+---
+
+## 十一、提交数据来源与服务端重算策略分析
+
+### 11.1 数据流全景：前端计算 → 隐藏表单 → 后端信任
+
+对账提交流程涉及**三处差额/余额计算**的代码位置：
+
+| 阶段 | 代码位置 | 计算方 | 目的 | 是否被 submit 信任 |
+|------|---------|-------|------|------------------|
+| ① 页面初始加载 | [ReconcileController::reconcile()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L130-L137) | 服务端 | 给 input 框填默认余额值 | ❌ |
+| ② 前端勾选时实时显示 | [Json\ReconcileController::overview()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Json/ReconcileController.php#L127-L134) | 服务端 | 返回 HTML 显示差额 + 渲染隐藏字段 | ❌（只是**用于显示**，submit 不回调此方法） |
+| ③ 真正提交 | [ReconcileStoreRequest::getAll()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Requests/ReconciliationStoreRequest.php#L48-L66) → [submit()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L176-L193) | **完全来自 POST 参数** | 实际执行对账与补偿 | ✅ |
+
+### 11.2 ReconciliationStoreRequest 数据提取：逐字段来源
+
+[getAll() 方法](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Requests/ReconciliationStoreRequest.php#L48-L66)：
+
+```php
+public function getAll(): array
+{
+    $transactions = $this->get('journals');
+    if (!is_array($transactions)) {
+        $transactions = [];
+    }
+    $data = [
+        'start'         => $this->getCarbonDate('start'),        // ✅ 来自 POST['start']（隐藏字段）
+        'end'           => $this->getCarbonDate('end'),          // ✅ 来自 POST['end']（隐藏字段）
+        'start_balance' => $this->convertString('startBalance'), // ✅ 来自 POST['startBalance']（隐藏字段）
+        'end_balance'   => $this->convertString('endBalance'),   // ✅ 来自 POST['endBalance']（隐藏字段）
+        'difference'    => $this->convertString('difference'),   // ✅ 来自 POST['difference']（隐藏字段）
+        'journals'      => $transactions,                        // ✅ 来自 POST['journals[]']（隐藏字段数组）
+        'reconcile'     => $this->convertString('reconcile'),    // ✅ 来自 POST['reconcile']（单选按钮值）
+    ];
+    return $data;
+}
+```
+
+验证规则 [rules() 方法](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Requests/ReconciliationStoreRequest.php#L71-L82)：
+
+```php
+public function rules(): array
+{
+    return [
+        'start'        => 'required|date',
+        'end'          => 'required|date',
+        'startBalance' => ['nullable', new IsValidAmount()],  // ⚠️ 仅校验格式合法，不校验数值正确
+        'endBalance'   => ['nullable', new IsValidAmount()],  // ⚠️ 仅校验格式合法，不校验数值正确
+        'difference'   => ['required', new IsValidAmount()],  // ⚠️ 仅校验格式合法，不校验数值正确
+        'journals'     => [new ValidJournals()],              // ⚠️ 仅校验"所有权归属当前用户"
+        'reconcile'    => 'required|in:create,nothing',
+    ];
+}
+```
+
+### 11.3 ValidJournals 规则的局限性
+
+[ValidJournals::validate()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Rules/ValidJournals.php#L40-L58) 仅做**存在性+归属校验**：
+
+```php
+public function validate(string $attribute, mixed $value, Closure $fail): void
+{
+    if (!is_array($value)) return;
+    $userId = auth()->user()->id;
+    foreach ($value as $journalId) {
+        // ⚠️ 只检查：该 journal_id 是否存在于当前用户下
+        $count = TransactionJournal::where('id', $journalId)->where('user_id', $userId)->count();
+        if (0 === $count) {
+            $fail('validation.invalid_selection')->translate();
+            return;
+        }
+        // ❌ 不检查：journal 的日期是否在 start/end 范围内
+        // ❌ 不检查：journal 是否属于当前对账的账户
+        // ❌ 不检查：journal 是否已被标记 reconciled=true（重复标记）
+        // ❌ 不检查：journal 的交易类型是否允许对账
+    }
+}
+```
+
+### 11.4 submit() 对传入数据的使用方式
+
+查看 [submit()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L176-L193) 如何使用 `$data`：
+
+```php
+// STEP 1: 直接使用前端传来的 journals 数组，不做二次过滤/重算
+foreach ($data['journals'] as $journalId) {
+    $this->repository->reconcileById((int) $journalId);   // 信任 journals，不检查日期/账户/重复
+}
+
+// STEP 2: 直接使用前端传来的 difference，不做二次计算
+if ('create' === $data['reconcile']) {
+    $result = $this->createReconciliation(
+        $account, $start, $end,
+        $data['difference']        // ⚠️ 信任前端传的差额金额，不重新计算
+    );
+}
+
+// ⚠️ 注意：$data['start_balance'] 和 $data['end_balance'] 被提取但 submit() 中 NEVER USED！
+// 它们存在于 POST 数据中，也被 getAll() 取出，但在 submit() 和 createReconciliation() 中完全未被引用
+```
+
+### 11.5 前端隐藏字段的注入路径（overview.twig）
+
+前端之所以能传这些值，是因为 [Json\ReconcileController::overview()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Json/ReconcileController.php#L127-L134) 计算后通过 [overview.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/resources/views/accounts/reconcile/overview.twig#L11-L50) 渲染为隐藏表单字段：
+
+```twig
+<form action="{{ route }}" method="POST">
+    <input type="hidden" name="start" value="{{ start.format('Y-m-d') }}"/>
+    <input type="hidden" name="end" value="{{ end.format('Y-m-d') }}"/>
+    <input type="hidden" name="startBalance" value="{{ startBalance }}"/>
+    <input type="hidden" name="endBalance" value="{{ endBalance }}"/>
+    <input type="hidden" name="difference" value="{{ difference }}"/>
+    {% for id in selectedIds %}
+        <input type="hidden" name="journals[]" value="{{ id }}"/>
+    {% endfor %}
+    <!-- 单选按钮 -->
+    <input type="radio" name="reconcile" value="create">
+    <input type="radio" name="reconcile" value="nothing" checked>
+</form>
+```
+
+但**浏览器提交时不会再次请求 overview() 重新计算**——这些隐藏字段的值是**用户点击"确认对账"那一瞬间的前端 DOM 快照**。
+
+---
+
+## 十二、一致性风险汇总与异常场景推演
+
+### 12.1 风险分类与严重程度
+
+| # | 风险点 | 触发条件 | 严重程度 | 影响 |
+|---|-------|---------|---------|------|
+| R1 | **无整体事务** | STEP 2 补偿交易创建失败时 STEP 1 已提交 | 🟥 高 | 对账标记已完成但余额未修正，用户困惑 |
+| R2 | **差额客户端信任** | 恶意篡改 POST['difference'] 金额 | 🟧 中高 | 可创建任意金额的补偿交易，影响账户余额 |
+| R3 | **journals 跨账户/跨期** | 篡改 POST['journals[]'] 加入非本账户、非本期、已对账的 journal | 🟧 中 | 错误标记无关交易为已对账，可能被重复对账 |
+| R4 | **DuplicateTransactionException 未捕获** | 极端重复提交（hash 冲突时） | 🟧 中 | 500 错误，状态同 R1 |
+| R5 | **起止余额未校验** | 篡改 startBalance/endBalance（虽然当前未使用，但语义上不严谨） | 🟩 低 | 当前无直接影响，若后续代码改动可能引入风险 |
+| R6 | **前端与服务端时间差** | 用户打开对账页面后，其他浏览器标签新增了期间内交易 | 🟧 中 | overview 计算时基于旧状态，提交时数据已变化，差额可能不准 |
+
+### 12.2 风险场景详细推演
+
+#### 场景 R1：补偿交易失败导致"半对账"（最易触发）
+
+**时序与后果**：
+
+```
+T1: 用户勾选 5 条交易，差额 = +25.00，选择"创建补偿交易"
+T2: 点击提交 → submit() 开始
+T3: STEP 1 - 循环调用 reconcileById()：
+    ├─ 更新 journal #101 → transactions reconciled=true (已 COMMIT)
+    ├─ 更新 journal #102 → transactions reconciled=true (已 COMMIT)
+    ├─ 更新 journal #103 → transactions reconciled=true (已 COMMIT)
+    ├─ 更新 journal #104 → transactions reconciled=true (已 COMMIT)
+    └─ 更新 journal #105 → transactions reconciled=true (已 COMMIT)
+T4: STEP 2 - createReconciliation()：
+    ├─ getReconciliation() OK
+    ├─ TransactionGroupFactory::create() → journal 创建时
+    │   └─ validateAccounts() 失败（极端情况下对账账户被软删除）
+    │       └─ 抛出 FireflyException("Source: xxx is invalid")
+    └─ catch 捕获，返回错误字符串
+T5: flash('error', 'reconciliation_error: Source: xxx is invalid')
+T6: 重定向到账户详情页
+
+状态快照：
+  • journal #101~#105: reconciled = true ✅ 已标记
+  • 补偿交易: 不存在 ❌
+  • 账户余额 SUM(amount): 仍比银行对账单少 25.00
+  • 用户体验: 看到 error 提示，但所有交易都显示"已对账"对勾
+```
+
+#### 场景 R2：恶意篡改差额数据（安全风险）
+
+假设攻击者通过浏览器 DevTools 修改隐藏字段：
+
+```
+POST /accounts/reconcile/3/submit/20260101/20260131
+
+原表单（正常）：
+  difference = 12.50
+  reconcile  = create
+  journals[] = [101, 102, 103]
+
+篡改后（恶意）：
+  difference = 9999999.99   ← 人为放大
+  reconcile  = create
+  journals[] = [101]        ← 只标记 1 条
+```
+
+**后端实际执行**：
+1. STEP 1：只将 journal #101 标记 `reconciled=true`（校验通过，因为 journal 属于用户）
+2. STEP 2：使用 `difference = 9999999.99` 创建补偿交易
+   - 若 `difference > 0`：创建 资产账户 → 对账账户 的 9,999,999.99 "Reconciliation" 交易
+   - **后果**：资产账户余额凭空减少近千万，余额严重失真
+   - 此交易类型在报表中是独立的，但对"净资产"和"可用余额"计算完全生效
+
+#### 场景 R3：跨账户、跨期标记对账
+
+正常流程：账户 A，2026-01 对账，选 journal #101 #102 #103
+
+篡改后：
+```
+journals[] = [101, 102, 103, 205, 333]
+```
+- journal #205：属于账户 B，2026-02 的一笔提现（属于同一用户 → ValidJournals 校验通过）
+- journal #333：已 reconciled=true 的历史交易（ValidJournals 不检查此状态）
+
+**执行后果**：
+- journal #205 的 `reconciled` 从 `false` → `true`（但它属于账户 B，用户在账户 A 对账时错误地标记了账户 B 的交易）
+- journal #333 的 `reconciled` 再次 `UPDATE ... SET true`（幂等，无副作用，但语义上不应该被"再次对账"）
+- 下次用户在账户 B 的对账流程中，journal #205 将作为"已对账交易"参与差额计算（clearedAmount），可能造成账户 B 的对账差额异常
+
+#### 场景 R6：并发写入导致的差额失真
+
+```
+T0: 用户A打开账户对账页面，加载 2026-01 的交易列表
+    → 期初余额 = 10000.00, 期末余额 = 12000.00, 交易 5 笔
+T1: 用户B（同账户另一标签页）新增一笔 2026-01-15 的支出 500.00（此时 DB 已更新）
+T2: 用户A勾选全部 5 条交易 → overview() 返回
+    → difference = (10000 - 12000) + 0 + (-2000) = 0
+    → 但 overview() 使用的是 T0 时刻的 journal 集合，不包含 T1 新增的 500
+T3: 用户A提交 → STEP 1 标记 5 条 → STEP 2 因 diff=0 不创建补偿
+T4: 状态：
+    • 5 条交易: reconciled = true
+    • T1 新增的 500: reconciled = false, 且未被纳入本次对账范围
+    • 实际余额 = 12000 - 500 = 11500，对账期末余额仍记为 12000
+    → 出现 500 的隐形差异，下次对账时才会暴露
+```
+
+### 12.3 针对风险的改进建议（概念性）
+
+| 风险 | 建议方案 |
+|------|---------|
+| R1（无整体事务） | 在 submit() 外层包裹 `DB::transaction(function() { ... })`，STEP 1 和 STEP 2 要么全成功要么全回滚 |
+| R2（差额信任前端） | 在 submit() 中服务端重新调用 Json\ReconcileController::overview 中的差额计算逻辑，校验前端传入的 difference 与服务端重算值一致（容差 0.01） |
+| R3（journals 校验不足） | 在 ValidJournals 中补充：① journal 涉及账户必须包含目标资产账户 ② journal 日期须在 [start, end] 范围内 ③ journal 当前 reconciled=false |
+| R4（异常漏捕获） | 在 createReconciliation() 的 try-catch 中加入 `catch (\Exception $e)` 兜底，或在 submit() 外层 catch 后手动回滚已对账标记 |
+| R6（并发差额） | 提交时重新基于 DB 当前状态重算差额，而非信任 overview 时刻的前端快照值 |
+
+---
+
+## 十三、附：代码引用索引表
+
+| 功能点 | 文件路径 | 行号范围 |
+|-------|---------|---------|
+| 对账提交主入口 | [ReconcileController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php) | #L169-L204 |
+| 补偿交易创建 | [ReconcileController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php) | #L211-L270 |
+| 对账标记（底层） | [JournalRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Repositories/Journal/JournalRepository.php) | #L245-L250 |
+| 提交请求数据提取 | [ReconciliationStoreRequest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Requests/ReconciliationStoreRequest.php) | #L48-L82 |
+| 交易 ID 所有权校验 | [ValidJournals.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Rules/ValidJournals.php) | #L40-L58 |
+| 差额（服务端显示用）计算 | [Json\ReconcileController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Json/ReconcileController.php) | #L71-L163 |
+| 对账调节账户获取/创建 | [AccountRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Repositories/Account/AccountRepository.php) | #L426-L458 |
+| 补偿交易落地（复式记账） | [TransactionJournalFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php) | #L230-L410 |
+| 单条 Transaction 创建（带 reconciled） | [TransactionFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionFactory.php) | #L121-L172 |
+| 余额聚合查询 | [Steam.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Support/Steam.php) | #L72-L157 |
+| 重复交易异常类 | [DuplicateTransactionException.php](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Exceptions/DuplicateTransactionException.php) | #L29-L32 |
+| 提交表单（隐藏字段）渲染 | [overview.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/resources/views/accounts/reconcile/overview.twig) | #L11-L104 |
