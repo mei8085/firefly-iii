@@ -469,9 +469,86 @@ private function createReconciliation(Account $account, Carbon $start, Carbon $e
 }
 ```
 
-⚠️ **关键细节**：方法签名标注了 `@throws DuplicateTransactionException`，但 `try-catch` **仅捕获 `FireflyException`**。而 [DuplicateTransactionException](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Exceptions/DuplicateTransactionException.php) 继承自原生 `Exception`，**不是** `FireflyException` 的子类。
+⚠️ **关键细节**：方法签名标注了 `@throws DuplicateTransactionException`，但 `try-catch` **仅捕获 `FireflyException`**。而 [DuplicateTransactionException](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Exceptions/DuplicateTransactionException.php#L32) 继承自原生 `\Exception`，**不是** `FireflyException` 的子类。
 
-### 10.3 各类失败场景的一致性状态矩阵
+### 10.3 重复交易异常（DuplicateTransactionException）激活条件深度分析
+
+这是一个容易被误解的点：**对账流程中的补偿交易创建，默认不会触发重复交易检查**。
+
+#### 10.3.1 触发开关：`errorOnHash` 属性
+
+[TransactionJournalFactory](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L75) 中有一个关键开关：
+
+```php
+private bool $errorOnHash = false;   // 默认关闭！
+```
+
+这个开关由 `setErrorOnHash()` 方法设置，在 [TransactionGroupFactory::create()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionGroupFactory.php#L62) 第 62 行被赋值：
+
+```php
+$this->journalFactory->setErrorOnHash($data['error_if_duplicate_hash'] ?? false);
+```
+
+而对账补偿交易的 `$submission` 数组（[createReconciliation() 第 235-254 行](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Http/Controllers/Account/ReconcileController.php#L235-L254)）中 **完全没有 `error_if_duplicate_hash` 字段**。
+
+**结论**：`errorIfDuplicate()` 方法第 422 行的判断 `if (false === $this->errorOnHash) { return; }` 会直接短路返回，**对账补偿交易不会执行重复检测**，`DuplicateTransactionException` 在对账流程中**不会被主动抛出**。
+
+#### 10.3.2 若被激活时的异常传递路径（假设 `errorOnHash=true`）
+
+虽然对账默认不触发，但为完整起见，梳理一旦激活后的完整传递链：
+
+```
+调用层级：
+  createReconciliation()
+    └─ TransactionGroupFactory::create()
+         └─ TransactionJournalFactory::create()
+              └─ createJournal()
+                   └─ errorIfDuplicate()  ← 这里抛出 DuplicateTransactionException
+```
+
+逐层向上的处理：
+
+| 层级 | 捕获情况 | 清理动作 | 后续行为 |
+|------|---------|---------|---------|
+| ① `createJournal()` | ❌ 无捕获 | 无 | 直接向上抛出 |
+| ② `TransactionJournalFactory::create()` 第 134 行 | ✅ 有捕获 | `forceDeleteOnError($collection)` 删除已创建的 journals | 重新 `throw new DuplicateTransactionException(...)` |
+| ③ `TransactionGroupFactory::create()` 第 66 行 | ✅ 有捕获 | 无（因为 journal 层已清理） | 重新 `throw new DuplicateTransactionException(...)` |
+| ④ `createReconciliation()` 第 264 行 | ❌ **漏捕获**！（只 catch FireflyException） | 无 | 继续向上冒泡 |
+| ⑤ `submit()` | ❌ 无捕获 | 无（STEP 1 对账标记已提交） | 继续向上冒泡 |
+| ⑥ Laravel 全局异常处理器 | ✅ 兜底捕获 | 无 | 返回 500 错误页面 |
+
+**漏捕获后果**：STEP 1 标记的对账流水已持久化 → 补偿交易在 journal 层被清理（无残留）→ 用户看到 500 错误 → 对账标记生效但余额未修正（同"半对账"不一致状态）
+
+#### 10.3.3 重复检测的哈希计算与匹配规则
+
+[hashArray() 第 524-538 行](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L524-L538) 将整行交易数据做 SHA-256 哈希：
+
+```php
+private function hashArray(NullArrayObject $row): string
+{
+    unset($row['import_hash_v2'], $row['original_source']);
+    $json = json_encode($row, JSON_THROW_ON_ERROR);
+    return hash('sha256', $json);
+}
+```
+
+[errorIfDuplicate() 第 419-444 行](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L419-L444) 的匹配查询：
+
+```sql
+SELECT journal_meta.*
+FROM journal_meta
+LEFT JOIN transaction_journals ON transaction_journals.id = journal_meta.transaction_journal_id
+WHERE transaction_journals.user_id = :userId
+  AND journal_meta.data = :hashValue
+  AND transaction_journals.deleted_at IS NULL
+LIMIT 1
+```
+
+- 匹配基于 `transaction_journal_meta` 表中名为 `import_hash_v2` 的元数据
+- 范围覆盖当前用户所有 journal（包含已软删除的？不，`WHERE transaction_journals.deleted_at IS NULL` 排除了软删除）
+- 命中则抛出异常，消息格式为 `"Duplicate of transaction #%d."`
+
+### 10.4 各类失败场景的一致性状态矩阵
 
 | 场景 | STEP 1 标记 | STEP 2 补偿 | 数据库状态 | 结果 |
 |------|------------|------------|-----------|------|
