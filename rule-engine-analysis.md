@@ -4,7 +4,7 @@
 
 Firefly III 的规则引擎是一套基于搜索的交易自动化处理系统，用户可以通过配置**条件（触发器）**和**动作**来实现交易的自动分类、打标签、设置预算等操作。规则引擎采用**搜索驱动**的设计理念，将条件匹配转化为搜索查询，通过搜索结果来驱动动作执行。
 
-核心入口：[SearchRuleEngine.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php)
+核心入口：[SearchRuleEngine.php](app/TransactionRules/Engine/SearchRuleEngine.php)
 
 ---
 
@@ -25,7 +25,7 @@ RuleGroup（规则组）
 
 #### RuleGroup（规则组）
 
-定义文件：[RuleGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleGroup.php)
+定义文件：[RuleGroup.php](app/Models/RuleGroup.php)
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
@@ -41,7 +41,7 @@ RuleGroup（规则组）
 
 #### Rule（规则）
 
-定义文件：[Rule.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/Rule.php)
+定义文件：[Rule.php](app/Models/Rule.php)
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
@@ -61,7 +61,7 @@ RuleGroup（规则组）
 
 #### RuleTrigger（触发器/条件）
 
-定义文件：[RuleTrigger.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleTrigger.php)
+定义文件：[RuleTrigger.php](app/Models/RuleTrigger.php)
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
@@ -73,7 +73,7 @@ RuleGroup（规则组）
 | `active` | bool | 是否激活 |
 | `stop_processing` | bool | 匹配后是否停止处理后续触发器 |
 
-支持的触发器类型在 [search.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/search.php) 中配置，共 100+ 种，涵盖：
+支持的触发器类型在 [search.php](config/search.php) 中配置，共 100+ 种，涵盖：
 - 账户相关：`source_account_is`, `destination_account_contains` 等
 - 描述相关：`description_is`, `description_contains` 等
 - 分类/预算/标签：`category_is`, `budget_contains`, `tag_is` 等
@@ -83,7 +83,7 @@ RuleGroup（规则组）
 
 #### RuleAction（动作）
 
-定义文件：[RuleAction.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleAction.php)
+定义文件：[RuleAction.php](app/Models/RuleAction.php)
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
@@ -95,7 +95,7 @@ RuleGroup（规则组）
 | `active` | bool | 是否激活 |
 | `stop_processing` | bool | 执行后是否停止处理后续动作 |
 
-支持的动作类型在 [firefly.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/firefly.php#L416-L449) 中配置，包括：
+支持的动作类型在 [firefly.php](config/firefly.php#L416-L449) 中配置，包括：
 - 分类操作：`set_category`, `clear_category`
 - 预算操作：`set_budget`, `clear_budget`
 - 标签操作：`add_tag`, `remove_tag`, `remove_all_tags`
@@ -116,7 +116,7 @@ RuleGroup（规则组）
 
 #### 严格模式（Strict = true，AND 逻辑）
 
-实现方法：[findStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L303-L366)
+实现方法：[findStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L303-L366)
 
 **工作原理**：
 1. 收集所有激活的触发器，构建搜索条件数组
@@ -136,7 +136,7 @@ return $searchEngine->searchTransactions();
 
 #### 非严格模式（Strict = false，OR 逻辑）
 
-实现方法：[findNonStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L204-L298)
+实现方法：[findNonStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L204-L298)
 
 **工作原理**：
 1. 按顺序逐个执行触发器
@@ -159,7 +159,7 @@ return $total->unique();
 
 ### 3.2 搜索驱动的条件匹配
 
-条件匹配的核心实现基于 [OperatorQuerySearch](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php) 类，它将各种触发器类型转换为数据库查询条件。
+条件匹配的核心实现基于 [OperatorQuerySearch](app/Support/Search/OperatorQuerySearch.php) 类，它将各种触发器类型转换为数据库查询条件。
 
 搜索流程：
 1. 解析查询字符串（如 `description_is:"超市" amount_less:"100"`）
@@ -173,7 +173,7 @@ return $total->unique();
 
 ### 4.1 动作工厂（ActionFactory）
 
-定义文件：[ActionFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Factory/ActionFactory.php)
+定义文件：[ActionFactory.php](app/TransactionRules/Factory/ActionFactory.php)
 
 动作采用**工厂模式**创建，根据 `action_type` 从配置中查找对应的实现类：
 
@@ -185,11 +185,11 @@ public static function getAction(RuleAction $action): ActionInterface
 }
 ```
 
-动作类型与实现类的映射关系在 [Domain.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Domain.php) 中通过配置 `firefly.rule-actions` 获取。
+动作类型与实现类的映射关系在 [Domain.php](app/Support/Domain.php) 中通过配置 `firefly.rule-actions` 获取。
 
 ### 4.2 动作接口（ActionInterface）
 
-定义文件：[ActionInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ActionInterface.php)
+定义文件：[ActionInterface.php](app/TransactionRules/Actions/ActionInterface.php)
 
 所有动作实现统一接口：
 
@@ -205,7 +205,7 @@ interface ActionInterface
 
 ### 4.3 动作执行示例
 
-以 [SetCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php) 为例：
+以 [SetCategory.php](app/TransactionRules/Actions/SetCategory.php) 为例：
 
 ```php
 public function actOnArray(array $journal): bool
@@ -240,14 +240,14 @@ public function actOnArray(array $journal): bool
 
 ### 5.1 整体执行架构
 
-规则引擎的执行入口是 [fire()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L95-L131) 方法，支持两种执行模式：
+规则引擎的执行入口是 [fire()](app/TransactionRules/Engine/SearchRuleEngine.php#L95-L131) 方法，支持两种执行模式：
 
 1. **独立规则模式**：直接设置规则集合（`setRules()`）
 2. **规则组模式**：设置规则组集合（`setRuleGroups()`）
 
 ### 5.2 规则组执行流程
 
-实现方法：[fireGroup()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L371-L395)
+实现方法：[fireGroup()](app/TransactionRules/Engine/SearchRuleEngine.php#L371-L395)
 
 ```
 开始执行规则组
@@ -288,7 +288,7 @@ foreach ($rules as $rule) {
 
 ### 5.3 单条规则执行流程
 
-实现方法：[fireRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L426-L442)
+实现方法：[fireRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L426-L442)
 
 ```
 开始执行规则
@@ -314,7 +314,7 @@ fireStrictRule  fireNonStrictRule
 
 ### 5.4 动作执行流程
 
-实现方法：[processTransactionJournal()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L574-L589)
+实现方法：[processTransactionJournal()](app/TransactionRules/Engine/SearchRuleEngine.php#L574-L589)
 
 ```
 对交易执行动作序列
@@ -402,7 +402,7 @@ Firefly III 规则引擎的"匹配冲突选优"并非传统规则引擎中的**�
 
 仅在**非严格模式**（OR 逻辑）下生效。
 
-代码位置：[findNonStrictRule() L274-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L274-L278)
+代码位置：[findNonStrictRule() L274-L278](app/TransactionRules/Engine/SearchRuleEngine.php#L274-L278)
 
 ```php
 // 如果触发器设置了 stop_processing 且匹配到结果，则停止后续触发器
@@ -416,7 +416,7 @@ if (true === $ruleTrigger->stop_processing && $result->count() > 0) {
 
 ### 6.4 动作层冲突解决
 
-代码位置：[processRuleAction() L546-L556](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L546-L556)
+代码位置：[processRuleAction() L546-L556](app/TransactionRules/Engine/SearchRuleEngine.php#L546-L556)
 
 ```php
 // 只有动作真正执行了修改（result=true）且设置了 stop_processing，才停止后续动作
@@ -433,7 +433,7 @@ if (true === $ruleAction->stop_processing && $result) {
 
 ### 6.5 规则层冲突解决
 
-代码位置：[fireGroup() L388-L392](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L388-L392)
+代码位置：[fireGroup() L388-L392](app/TransactionRules/Engine/SearchRuleEngine.php#L388-L392)
 
 ```php
 // 在规则组内，如果规则触发且设置了 stop_processing，则停止组内后续规则
@@ -445,7 +445,7 @@ if ($result && true === $rule->stop_processing) {
 
 **重要注意**：在**非规则组模式**下（直接通过 `setRules()` 设置规则），`stop_processing` 会被**忽略**：
 
-代码位置：[fire() L107-L115](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L107-L115)
+代码位置：[fire() L107-L115](app/TransactionRules/Engine/SearchRuleEngine.php#L107-L115)
 
 ```php
 if ($result && true === $rule->stop_processing) {
@@ -476,7 +476,7 @@ Firefly III 的冲突选优可以总结为：
 
 规则引擎通过事件监听机制，在交易创建/更新时自动执行。
 
-核心 Trait：[SupportsGroupProcessingTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php)
+核心 Trait：[SupportsGroupProcessingTrait.php](app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php)
 
 ```php
 protected function processRules(Collection $set, string $type): void
@@ -498,15 +498,15 @@ protected function processRules(Collection $set, string $type): void
 ```
 
 相关监听器：
-- [ProcessesNewTransactionGroup.php]() - 新交易创建时触发
-- [ProcessesUpdatedTransactionGroup.php]() - 交易更新时触发
+- [ProcessesNewTransactionGroup.php](app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php) - 新交易创建时触发
+- [ProcessesUpdatedTransactionGroup.php](app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php) - 交易更新时触发
 
 ### 7.2 手动触发
 
 用户也可以通过界面或 API 手动触发规则：
-- 控制台命令：[ApplyRules.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Console/Commands/Tools/ApplyRules.php)
-- Web 控制器：[ExecutionController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/RuleGroup/ExecutionController.php)
-- API 控制器：[TriggerController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Api/V1/Controllers/Models/RuleGroup/TriggerController.php)
+- 控制台命令：[ApplyRules.php](app/Console/Commands/Tools/ApplyRules.php)
+- Web 控制器：[ExecutionController.php](app/Http/Controllers/RuleGroup/ExecutionController.php)
+- API 控制器：[TriggerController.php](app/Api/V1/Controllers/Models/RuleGroup/TriggerController.php)
 
 ---
 
@@ -514,7 +514,7 @@ protected function processRules(Collection $set, string $type): void
 
 ### 8.1 规则引擎绑定
 
-在 [FireflyServiceProvider.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Providers/FireflyServiceProvider.php#L171-L178) 中注册：
+在 [FireflyServiceProvider.php](app/Providers/FireflyServiceProvider.php#L171-L178) 中注册：
 
 ```php
 $this->app->bind(static function (Application $app): RuleEngineInterface {
@@ -528,7 +528,7 @@ $this->app->bind(static function (Application $app): RuleEngineInterface {
 
 ### 8.2 规则仓库绑定
 
-在 [RuleServiceProvider.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Providers/RuleServiceProvider.php) 中注册规则和规则组的仓库类。
+在 [RuleServiceProvider.php](app/Providers/RuleServiceProvider.php) 中注册规则和规则组的仓库类。
 
 ---
 
@@ -572,7 +572,7 @@ $this->app->bind(static function (Application $app): RuleEngineInterface {
 
 #### 阶段一：事件监听器发起调用
 
-入口：[SupportsGroupProcessingTrait::processRules()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php#L29-L66)
+入口：[SupportsGroupProcessingTrait::processRules()](app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php#L29-L66)
 
 ```php
 protected function processRules(Collection $set, string $type): void
@@ -602,14 +602,14 @@ protected function processRules(Collection $set, string $type): void
 
 #### 阶段二：SearchRuleEngine 内部持有 operators
 
-定义：[SearchRuleEngine.php L53](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L53)
+定义：[SearchRuleEngine.php L53](app/TransactionRules/Engine/SearchRuleEngine.php#L53)
 
 ```php
 // 私有成员变量，存储所有外部注入的"附加查询条件"
 private array $operators = [];
 ```
 
-注入方法：[addOperator()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L66-L70)
+注入方法：[addOperator()](app/TransactionRules/Engine/SearchRuleEngine.php#L66-L70)
 
 ```php
 public function addOperator(array $operator): void
@@ -619,7 +619,7 @@ public function addOperator(array $operator): void
 }
 ```
 
-清除方法：[removeOperator()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L142-L154)
+清除方法：[removeOperator()](app/TransactionRules/Engine/SearchRuleEngine.php#L142-L154)
 
 ```php
 public function removeOperator(string $type): void
@@ -640,7 +640,7 @@ public function removeOperator(string $type): void
 
 ##### 非严格模式下的挂入
 
-代码位置：[findNonStrictRule() L251-L255](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L251-L255)
+代码位置：[findNonStrictRule() L251-L255](app/TransactionRules/Engine/SearchRuleEngine.php#L251-L255)
 
 ```php
 // 1. 先构建规则自身定义的触发器条件
@@ -659,7 +659,7 @@ foreach ($this->operators as $operator) {
 
 ##### 严格模式下的挂入
 
-代码位置：[findStrictRule() L338-L341](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L338-L341)
+代码位置：[findStrictRule() L338-L341](app/TransactionRules/Engine/SearchRuleEngine.php#L338-L341)
 
 ```php
 // 1. 先收集所有触发器（AND 组合）
@@ -680,7 +680,7 @@ foreach ($this->operators as $operator) {
 
 #### 阶段四：OperatorQuerySearch 解析 journal_id 操作符
 
-代码位置：[OperatorQuerySearch::updateCollector() L1497-L1501](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php#L1497-L1501)
+代码位置：[OperatorQuerySearch::updateCollector() L1497-L1501](app/Support/Search/OperatorQuerySearch.php#L1497-L1501)
 
 ```php
 case 'journal_id':
@@ -692,7 +692,7 @@ case 'journal_id':
 
 #### 阶段五：GroupCollector 落地为 SQL 条件
 
-代码位置：[GroupCollector::setJournalIds()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Helpers/Collector/GroupCollector.php#L540-L551)
+代码位置：[GroupCollector::setJournalIds()](app/Helpers/Collector/GroupCollector.php#L540-L551)
 
 ```php
 public function setJournalIds(array $journalIds): GroupCollectorInterface
@@ -773,21 +773,20 @@ Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链�
 
 ##### 事实一：`UpdatedSingleTransactionGroup` 是业务层手动广播的，不是 Eloquent Model 事件自动触发的
 
-在整个代码库里，该事件共被显式 `event(new UpdatedSingleTransactionGroup(...))` 广播了 **9 处**，主要来源：
+在整个代码库里，该事件共被显式 `event(new UpdatedSingleTransactionGroup(...))` 广播了 **8 处**，全部是业务层代码主动调用，与 Model 层无关。主要来源：
 
 | 广播位置 | 场景 | applyRules 默认值 |
 |----------|------|-------------------|
-| [SearchRuleEngine::fireStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L466) | 规则引擎严格模式执行完 | **false**（引擎显式设置） |
-| [SearchRuleEngine::fireNonStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L415) | 规则引擎非严格模式执行完 | **false**（引擎显式设置） |
-| [TransactionGroupRepository::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L365) | 用户新建交易（发出 `CreatedSingleTransactionGroup`） | `$data['apply_rules'] ?? true` |
-| [AccountServiceTrait](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Services/Internal/Support/AccountServiceTrait.php) | 账户服务内部变更 | **false** |
-| [MassController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/MassController.php) | 批量编辑 | true（默认构造） |
-| [ConvertController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/ConvertController.php) | 转换交易类型 | true（默认构造） |
-| [BulkController](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/BulkController.php) | 批量操作 | 取决于请求参数 |
-| [CorrectsGroupAccounts](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Console/Commands/Correction/CorrectsGroupAccounts.php) | 修复命令 | **false** |
-| [UpdateController (API)](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php) | API 更新交易 | 取决于请求参数 |
+| [SearchRuleEngine::fireStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L466) | 规则引擎严格模式执行完 | **false**（引擎显式设置） |
+| [SearchRuleEngine::fireNonStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L415) | 规则引擎非严格模式执行完 | **false**（引擎显式设置） |
+| [AccountServiceTrait](app/Services/Internal/Support/AccountServiceTrait.php) | 账户服务内部变更 | **false** |
+| [MassController](app/Http/Controllers/Transaction/MassController.php) | 批量编辑 | true（默认构造） |
+| [ConvertController](app/Http/Controllers/Transaction/ConvertController.php) | 转换交易类型 | true（默认构造） |
+| [BulkController](app/Http/Controllers/Transaction/BulkController.php) | 批量操作 | 取决于请求参数 |
+| [CorrectsGroupAccounts](app/Console/Commands/Correction/CorrectsGroupAccounts.php) | 修复命令 | **false** |
+| [UpdateController (API)](app/Api/V1/Controllers/Models/Transaction/UpdateController.php) | API 更新交易 | 取决于请求参数 |
 
-`UpdatedSingleTransactionGroup` **不跟 Eloquent ORM 的 `saving` / `saved` / `updating` / `updated` 事件挂钩**——它完全是业务层自己控制什么时候发。`TransactionGroup` 模型上唯一注册的 Observer 是 [DeletedTransactionGroupObserver](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Handlers/Observer/DeletedTransactionGroupObserver.php)，只监听 `deleting`，与更新事件无关。
+`UpdatedSingleTransactionGroup` **不跟 Eloquent ORM 的 `saving` / `saved` / `updating` / `updated` 事件挂钩**——它完全是业务层自己控制什么时候发。`TransactionGroup` 模型上唯一注册的 Observer 是 [DeletedTransactionGroupObserver](app/Handlers/Observer/DeletedTransactionGroupObserver.php)，只监听 `deleting`，与更新事件无关。
 
 ##### 事实二：动作本身不会直接触发 `UpdatedSingleTransactionGroup`
 
@@ -796,11 +795,11 @@ Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链�
 **写法 A（绝大多数动作）：`DB::table()->update/insert/delete`**
 
 例如：
-- [SetCategory L92-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L92-L96)：`DB::table('category_transaction_journal')->...`
-- [SetDescription L64](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php#L64)：`DB::table('transaction_journals')->where('id', ...)->update(...)`
-- [SetBudget L98-L102](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetBudget.php#L98-L102)
-- [SetDestinationAccount L127](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php#L127)
-- [ConvertToWithdrawal L166-L173](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ConvertToWithdrawal.php#L166-L173)
+- [SetCategory L92-L96](app/TransactionRules/Actions/SetCategory.php#L92-L96)：`DB::table('category_transaction_journal')->...`
+- [SetDescription L64](app/TransactionRules/Actions/SetDescription.php#L64)：`DB::table('transaction_journals')->where('id', ...)->update(...)`
+- [SetBudget L98-L102](app/TransactionRules/Actions/SetBudget.php#L98-L102)
+- [SetDestinationAccount L127](app/TransactionRules/Actions/SetDestinationAccount.php#L127)
+- [ConvertToWithdrawal L166-L173](app/TransactionRules/Actions/ConvertToWithdrawal.php#L166-L173)
 
 `DB::table()` 走的是 Laravel Query Builder，**绕开 Eloquent ORM**，所以：
 - ❌ 不会触发任何 Model 事件（`saving`、`saved`、`updating`、`updated`）
@@ -810,9 +809,9 @@ Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链�
 
 目前代码中只有 3 个动作使用了 `->save()`：
 
-- [SetNotes L56](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetNotes.php#L56)：`$dbNote->save()`（操作 Note 模型）
-- [SwitchAccounts L97-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SwitchAccounts.php#L97-L98)：`$sourceTransaction->save()` 和 `$destTransaction->save()`（操作 Transaction 模型）
-- [SetAmount L106](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetAmount.php#L106)：`$transaction->save()` + `$object->transactionGroup->touch()`
+- [SetNotes L56](app/TransactionRules/Actions/SetNotes.php#L56)：`$dbNote->save()`（操作 Note 模型）
+- [SwitchAccounts L97-L98](app/TransactionRules/Actions/SwitchAccounts.php#L97-L98)：`$sourceTransaction->save()` 和 `$destTransaction->save()`（操作 Transaction 模型）
+- [SetAmount L106](app/TransactionRules/Actions/SetAmount.php#L106)：`$transaction->save()` + `$object->transactionGroup->touch()`
 
 这些 `->save()` **会触发对应 Model 的 Observer**，但 Observer 里只做本位币金额换算等数据维护工作，**完全不会广播 `UpdatedSingleTransactionGroup`**。也就是说，即使动作用了 Eloquent 写法，也不会间接引发规则引擎的二次执行。
 
@@ -821,61 +820,9 @@ Firefly III 通过 **`TransactionGroupEventFlags` 标志位**在事件传播链�
 - ✅ 动作执行完后这条事件是 **SearchRuleEngine 自己在 fireStrictRule / fireNonStrictRule 的末尾主动发出来的**
 - ✅ 发的时候 `flags->applyRules` 已经被设为 `false`
 
-**两个需要先讲准的关键事实**：
-
-#### 事实一：`UpdatedSingleTransactionGroup` 是业务层手动广播的，不是 Eloquent Model 事件自动触发的
-
-在整个代码库里，该事件共被显式 `event(new UpdatedSingleTransactionGroup(...))` 广播了 **9 处**，主要来源：
-
-| 广播位置 | 场景 | applyRules 默认值 |
-|----------|------|-------------------|
-| [SearchRuleEngine::fireStrictRule() L466](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L466) | 规则引擎严格模式执行完 | **false**（引擎显式设置） |
-| [SearchRuleEngine::fireNonStrictRule() L415](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L415) | 规则引擎非严格模式执行完 | **false**（引擎显式设置） |
-| [TransactionGroupRepository::store() L368](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L368) | 用户新建交易（这是 `CreatedSingleTransactionGroup`） | `$data['apply_rules'] ?? true` |
-| [AccountServiceTrait L675](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Services/Internal/Support/AccountServiceTrait.php#L675) | 账户服务内部变更 | **false** |
-| [MassController L282](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/MassController.php#L282) | 批量编辑 | true（默认构造） |
-| [ConvertController L170](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/ConvertController.php#L170) | 转换交易类型 | true（默认构造） |
-| [BulkController L124](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Http/Controllers/Transaction/BulkController.php#L124) | 批量操作 | 取决于请求参数 |
-| [CorrectsGroupAccounts L71](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Console/Commands/Correction/CorrectsGroupAccounts.php#L71) | 修复命令 | **false** |
-| [UpdateController (API) L97](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Api/V1/Controllers/Models/Transaction/UpdateController.php#L97) | API 更新交易 | 取决于请求参数 `applyRules` |
-
-`UpdatedSingleTransactionGroup` **不跟 Eloquent ORM 的 `saving` / `saved` / `updating` / `updated` 事件挂钩**——它完全是业务层自己控制什么时候发。
-
-#### 事实二：动作本身不会直接触发 `UpdatedSingleTransactionGroup`
-
-动作修改数据库分两种写法，但**无论哪种都不会直接产生 `UpdatedSingleTransactionGroup` 事件**：
-
-**写法 A（绝大多数动作）：`DB::table()->update/insert/delete`**
-
-例如：
-- [SetCategory L92-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L92-L96)：`DB::table('category_transaction_journal')->...`
-- [SetDescription L64](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php#L64)：`DB::table('transaction_journals')->where('id', ...)->update(...)`
-- [SetBudget L98-L102](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetBudget.php#L98-L102)
-- [SetDestinationAccount L127](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php#L127)
-- [ConvertToWithdrawal L166-L173](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ConvertToWithdrawal.php#L166-L173)
-
-`DB::table()` 走的是 Laravel Query Builder，**绕开 Eloquent ORM**，所以：
-- ❌ 不会触发任何 Model 事件（`saving`、`saved`、`updating`、`updated`）
-- ❌ 自然不会广播 `UpdatedSingleTransactionGroup`
-
-**写法 B（少数动作）：Eloquent Model 的 `->save()`**
-
-目前代码中只有 3 个动作使用了 `->save()`：
-
-- [SetNotes L56](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetNotes.php#L56)：`$dbNote->save()`（操作 Note 模型）
-- [SwitchAccounts L97-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SwitchAccounts.php#L97-L98)：`$sourceTransaction->save()` 和 `$destTransaction->save()`（操作 Transaction 模型）
-- [PrependNotes L62](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/PrependNotes.php)、[AppendNotes L65](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/AppendNotes.php)：操作 Note 模型
-
-这些 `->save()` **会触发对应 Model 的 Observer**（例如 Transaction 模型通过 `#[ObservedBy([TransactionObserver::class])]` 注册了观察者）。但 [TransactionObserver::updated()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Handlers/Observer/TransactionObserver.php#L44-L47) 只做一件事——把金额换算成本位币金额（`updatePrimaryCurrencyAmount`），**完全不会广播 `UpdatedSingleTransactionGroup`**。
-
-所以结论是：
-- ✅ `UpdatedSingleTransactionGroup` 只来自业务层显式的 `event(...)` 调用
-- ✅ 动作执行完后这条事件是 **SearchRuleEngine 自己在 fireStrictRule / fireNonStrictRule 的末尾主动发出来的**
-- ✅ 发的时候 `flags->applyRules` 已经被设为 `false`
-
 ### 11.2 核心角色：TransactionGroupEventFlags
 
-定义文件：[TransactionGroupEventFlags.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php)
+定义文件：[TransactionGroupEventFlags.php](app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php)
 
 ```php
 class TransactionGroupEventFlags
@@ -896,7 +843,7 @@ class TransactionGroupEventFlags
 
 #### 第一层：规则引擎在 fire 时主动置 false
 
-在 [fireStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L449-L477) 和 [fireNonStrictRule()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L402-L419) 中：
+在 [fireStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L449-L477) 和 [fireNonStrictRule()](app/TransactionRules/Engine/SearchRuleEngine.php#L402-L419) 中：
 
 ```php
 private function fireStrictRule(Rule $rule): bool
@@ -936,7 +883,7 @@ private function fireNonStrictRule(Rule $rule): bool
 
 #### 第二层：监听器接收到事件后检查 flags
 
-在 [ProcessesUpdatedTransactionGroup::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php#L40-L75)：
+在 [ProcessesUpdatedTransactionGroup::handle()](app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php#L40-L75)：
 
 ```php
 public function handle(UpdatedSingleTransactionGroup $event): void
@@ -963,7 +910,7 @@ public function handle(UpdatedSingleTransactionGroup $event): void
 }
 ```
 
-同理，[ProcessesNewTransactionGroup::handle()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php#L53-L65) 也是完全同样的判断逻辑。
+同理，[ProcessesNewTransactionGroup::handle()](app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php#L53-L65) 也是完全同样的判断逻辑。
 
 ### 11.4 防循环时序图
 
@@ -1004,7 +951,7 @@ public function handle(UpdatedSingleTransactionGroup $event): void
 
 除了 flags 机制外，每个动作实现也都有**幂等检查**，构成第二道防线：
 
-以 [SetCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php#L86-L90) 为例：
+以 [SetCategory.php](app/TransactionRules/Actions/SetCategory.php#L86-L90) 为例：
 
 ```php
 // 检查旧分类是否与新分类相同
@@ -1015,9 +962,9 @@ if ((int)$oldCategory?->id === $category->id) {
 ```
 
 所有动作都有类似逻辑：
-- [SetDescription.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDescription.php)：比较 before/after 字符串是否相同
-- [SetDestinationAccount.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetDestinationAccount.php)：比较旧账户ID与新账户ID
-- [AddTag.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/AddTag.php)：检查标签是否已存在
+- [SetDescription.php](app/TransactionRules/Actions/SetDescription.php)：比较 before/after 字符串是否相同
+- [SetDestinationAccount.php](app/TransactionRules/Actions/SetDestinationAccount.php)：比较旧账户ID与新账户ID
+- [AddTag.php](app/TransactionRules/Actions/AddTag.php)：检查标签是否已存在
 
 **双重保险**：
 1. **第一道（flags）**：从事件源头上不让规则引擎被二次调用
@@ -1053,7 +1000,7 @@ if ((int)$oldCategory?->id === $category->id) {
 
 #### 第 1 层：规则组的 order
 
-代码位置：[RuleGroupRepository::getRuleGroupsWithRules()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L220-L236)
+代码位置：[RuleGroupRepository::getRuleGroupsWithRules()](app/Repositories/RuleGroup/RuleGroupRepository.php#L220-L236)
 
 ```php
 $groups = $this->user
@@ -1065,8 +1012,8 @@ $groups = $this->user
 ```
 
 类似的加载点还有：
-- [getActiveGroups()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L126-L134) → `orderBy('order', 'ASC')`
-- [get()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L121-L124) → `orderBy('order', 'ASC')`
+- [getActiveGroups()](app/Repositories/RuleGroup/RuleGroupRepository.php#L126-L134) → `orderBy('order', 'ASC')`
+- [get()](app/Repositories/RuleGroup/RuleGroupRepository.php#L121-L124) → `orderBy('order', 'ASC')`
 
 #### 第 2 层：规则的 order
 
@@ -1082,7 +1029,7 @@ $groups = $this->user
 
 如果规则组没有使用 `with()` 预加载，SearchRuleEngine 内部也会重新加载时排序：
 
-[fireGroup() L378-L381](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L378-L381)：
+[fireGroup() L378-L381](app/TransactionRules/Engine/SearchRuleEngine.php#L378-L381)：
 ```php
 $rules = $group
     ->rules()
@@ -1103,12 +1050,12 @@ $rules = $group
 
 SearchRuleEngine 内部加载时也排序：
 
-[findNonStrictRule() L213](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L213)：
+[findNonStrictRule() L213](app/TransactionRules/Engine/SearchRuleEngine.php#L213)：
 ```php
 $triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
 ```
 
-[findStrictRule() L309](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L309)：
+[findStrictRule() L309](app/TransactionRules/Engine/SearchRuleEngine.php#L309)：
 ```php
 $triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
 ```
@@ -1125,7 +1072,7 @@ $triggers = $rule->ruleTriggers()->orderBy('order', 'ASC')->get();
 
 SearchRuleEngine 内部执行时同样排序：
 
-[processTransactionJournal() L577](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php#L577)：
+[processTransactionJournal() L577](app/TransactionRules/Engine/SearchRuleEngine.php#L577)：
 ```php
 $actions = $rule->ruleActions()->orderBy('order', 'ASC')->get();
 ```
@@ -1171,7 +1118,7 @@ RuleGroup(order=3) "清理规则组"
 
 ### 12.4 Order 的维护
 
-RuleGroupRepository 提供了重排方法：[correctRuleGroupOrder()](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php#L44-L69)
+RuleGroupRepository 提供了重排方法：[correctRuleGroupOrder()](app/Repositories/RuleGroup/RuleGroupRepository.php#L44-L69)
 
 ```php
 public function correctRuleGroupOrder(): void
@@ -1208,39 +1155,21 @@ public function correctRuleGroupOrder(): void
 
 | 文件路径 | 说明 |
 |----------|------|
-| [app/TransactionRules/Engine/SearchRuleEngine.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php) | 规则引擎核心实现（含 addOperator/removeOperator/fireStrictRule/fireNonStrictRule） |
-| [app/TransactionRules/Engine/RuleEngineInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/RuleEngineInterface.php) | 规则引擎接口 |
-| [app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php) | processRules() 循环注入 journal_id 的入口 |
-| [app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php) | 新交易事件监听器（检查 flags） |
-| [app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php) | 更新交易事件监听器（检查 flags） |
-| [app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php) | 事件标志位（applyRules/fireWebhooks 等） |
-| [app/Repositories/RuleGroup/RuleGroupRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Repositories/RuleGroup/RuleGroupRepository.php) | 规则组仓库（含四层 ORDER BY） |
-| [app/Models/Rule.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/Rule.php) | 规则模型 |
-| [app/Models/RuleGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleGroup.php) | 规则组模型 |
-| [app/Models/RuleTrigger.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleTrigger.php) | 触发器模型 |
-| [app/Models/RuleAction.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleAction.php) | 动作模型 |
-| [app/TransactionRules/Factory/ActionFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Factory/ActionFactory.php) | 动作工厂 |
-| [app/TransactionRules/Actions/ActionInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ActionInterface.php) | 动作接口 |
-| [app/TransactionRules/Actions/SetCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/SetCategory.php) | 动作示例（含幂等检查） |
-| [app/Support/Search/OperatorQuerySearch.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php) | 搜索实现（journal_id case） |
-| [app/Helpers/Collector/GroupCollector.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Helpers/Collector/GroupCollector.php) | 查询收集器（setJournalIds → whereIn） |
-| [config/search.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/search.php) | 搜索操作符配置 |
-| [config/firefly.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/firefly.php) | 动作类型配置 |
-
----
-
-## 十四、参考文件清单
-
-| 文件路径 | 说明 |
-|----------|------|
-| [app/TransactionRules/Engine/SearchRuleEngine.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php) | 规则引擎核心实现 |
-| [app/TransactionRules/Engine/RuleEngineInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Engine/RuleEngineInterface.php) | 规则引擎接口 |
-| [app/Models/Rule.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/Rule.php) | 规则模型 |
-| [app/Models/RuleGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleGroup.php) | 规则组模型 |
-| [app/Models/RuleTrigger.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleTrigger.php) | 触发器模型 |
-| [app/Models/RuleAction.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Models/RuleAction.php) | 动作模型 |
-| [app/TransactionRules/Factory/ActionFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Factory/ActionFactory.php) | 动作工厂 |
-| [app/TransactionRules/Actions/ActionInterface.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/TransactionRules/Actions/ActionInterface.php) | 动作接口 |
-| [app/Support/Search/OperatorQuerySearch.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/app/Support/Search/OperatorQuerySearch.php) | 搜索实现 |
-| [config/search.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/search.php) | 搜索操作符配置 |
-| [config/firefly.php](file:///d:/fz/0601-1/solo-dogfeeding/code/25-firefly-iii/config/firefly.php) | 动作类型配置 |
+| [app/TransactionRules/Engine/SearchRuleEngine.php](app/TransactionRules/Engine/SearchRuleEngine.php) | 规则引擎核心实现（含 addOperator/removeOperator/fireStrictRule/fireNonStrictRule） |
+| [app/TransactionRules/Engine/RuleEngineInterface.php](app/TransactionRules/Engine/RuleEngineInterface.php) | 规则引擎接口 |
+| [app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php](app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php) | processRules() 循环注入 journal_id 的入口 |
+| [app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php](app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php) | 新交易事件监听器（检查 flags） |
+| [app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php](app/Listeners/Model/TransactionGroup/ProcessesUpdatedTransactionGroup.php) | 更新交易事件监听器（检查 flags） |
+| [app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php](app/Events/Model/TransactionGroup/TransactionGroupEventFlags.php) | 事件标志位（applyRules/fireWebhooks 等） |
+| [app/Repositories/RuleGroup/RuleGroupRepository.php](app/Repositories/RuleGroup/RuleGroupRepository.php) | 规则组仓库（含四层 ORDER BY） |
+| [app/Models/Rule.php](app/Models/Rule.php) | 规则模型 |
+| [app/Models/RuleGroup.php](app/Models/RuleGroup.php) | 规则组模型 |
+| [app/Models/RuleTrigger.php](app/Models/RuleTrigger.php) | 触发器模型 |
+| [app/Models/RuleAction.php](app/Models/RuleAction.php) | 动作模型 |
+| [app/TransactionRules/Factory/ActionFactory.php](app/TransactionRules/Factory/ActionFactory.php) | 动作工厂 |
+| [app/TransactionRules/Actions/ActionInterface.php](app/TransactionRules/Actions/ActionInterface.php) | 动作接口 |
+| [app/TransactionRules/Actions/SetCategory.php](app/TransactionRules/Actions/SetCategory.php) | 动作示例（含幂等检查） |
+| [app/Support/Search/OperatorQuerySearch.php](app/Support/Search/OperatorQuerySearch.php) | 搜索实现（journal_id case） |
+| [app/Helpers/Collector/GroupCollector.php](app/Helpers/Collector/GroupCollector.php) | 查询收集器（setJournalIds → whereIn） |
+| [config/search.php](config/search.php) | 搜索操作符配置 |
+| [config/firefly.php](config/firefly.php) | 动作类型配置 |
