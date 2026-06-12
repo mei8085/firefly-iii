@@ -1027,71 +1027,221 @@ public function deleting(TransactionGroup $transactionGroup): void
 
 但对于孤儿 journal（`transaction_group_id = null`），**没有任何 group 触发此 observer**，所以孤儿 journal 只能被手动发现和删除。
 
-#### 10.6.5 forceDeleteOnError 清理的实际范围与局限
+#### 10.6.5 附属数据清理机制：观察器级联删除链深度分析
 
-[forceDeleteOnError()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Factory/TransactionJournalFactory.php#L450-L460) 调用 [JournalDestroyService::destroy()](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Services/Internal/Destroy/JournalDestroyService.php#L35-L49)：
+之前章节中关于"子表数据全部残留"的结论**需要修正**。Firefly III 为 `TransactionJournal` 注册了 [DeletedTransactionJournalObserver](file:///d:/fz/0601-1/solo-dogfeeding/code/24-firefly-iii/app/Handlers/Observer/DeletedTransactionJournalObserver.php#L36-L81)，通过 Laravel 的 `#[ObservedBy]` 属性声明：
 
 ```php
-public function destroy(TransactionJournal $journal): void
+// TransactionJournal.php 第 53 行
+#[ObservedBy([DeletedTransactionJournalObserver::class])]
+```
+
+**这意味着当 journal 执行 `delete()`（软删除）时，`deleting` 事件会触发观察器**，观察器会**同步**清理几乎所有附属数据。
+
+##### DeletedTransactionJournalObserver::deleting() 完整清理清单
+
+```php
+// DeletedTransactionJournalObserver.php 第 38-81 行
+public function deleting(TransactionJournal $transactionJournal): void
 {
-    $group = $journal->transactionGroup;
-    if (null !== $group) {
-        $count = $group->transactionJournals->count();
-        if (0 === $count) {
-            $group->delete();    // 触发 DeletedTransactionGroupObserver → 级联软删
+    // ① 软删除所有 transactions（禁止递归触发事件）
+    TransactionJournal::withoutEvents(static function () use ($transactionJournal): void {
+        foreach ($transactionJournal->transactions()->get() as $transaction) {
+            $transaction->delete();       // 软删除，不触发 TransactionObserver
         }
+    });
+
+    // ② 物理删除 journal links（source 侧）
+    TransactionJournalLink::where('source_id', $transactionJournal->id)->delete();
+    // ③ 物理删除 journal links（destination 侧）
+    TransactionJournalLink::where('destination_id', $transactionJournal->id)->delete();
+
+    // ④ 解绑 piggy bank events（SET transaction_journal_id = NULL）
+    $transactionJournal->piggyBankEvents()->update(['transaction_journal_id' => null]);
+
+    // ⑤ 物理删除 budget pivot
+    DB::table('budget_transaction_journal')
+        ->where('transaction_journal_id', $transactionJournal->id)->delete();
+    // ⑥ 物理删除 category pivot
+    DB::table('category_transaction_journal')
+        ->where('transaction_journal_id', $transactionJournal->id)->delete();
+    // ⑦ 物理删除 tag pivot
+    DB::table('tag_transaction_journal')
+        ->where('transaction_journal_id', $transactionJournal->id)->delete();
+
+    // ⑧ 物理删除 attachments（含文件）
+    foreach ($transactionJournal->attachments()->get() as $attachment) {
+        $repository->destroy($attachment);
     }
-    $journal->delete();          // 软删除
+
+    // ⑨ 物理删除 journal meta
+    $transactionJournal->transactionJournalMeta()->delete();
+    // ⑩ 物理删除 locations
+    $transactionJournal->locations()->delete();
+    // ⑪ 物理删除 notes
+    $transactionJournal->notes()->delete();
+    // ⑫ 物理删除 source journal links（二次清理）
+    $transactionJournal->sourceJournalLinks()->delete();
+    // ⑬ 物理删除 dest journal links（二次清理）
+    $transactionJournal->destJournalLinks()->delete();
+    // ⑭ 物理删除 audit log entries
+    $transactionJournal->auditLogEntries()->delete();
 }
 ```
 
-**清理范围的精确评估**：
+**关键区别**：观察器对附属数据使用的是**物理删除**（`delete()` 不带 SoftDeletes），而非软删除。只有 journal 和 transactions 本身是软删除。
 
-| 被清理的数据 | 清理机制 | 是否彻底 |
-|------------|---------|---------|
-| `transaction_journals` | 软删除（`deleted_at` 非空） | ⚠️ 记录仍存在，但余额计算排除 |
-| `transactions` | 依赖外键级联或 observer？**均无显式清理** | ⚠️ 但 journal 软删除后，余额查询 JOIN `transaction_journals` 时 `WHERE deleted_at IS NULL` 排除了这些 transactions |
-| `transaction_groups` | 若 group 为空则 `delete()`，触发 observer | ✅ group 被清理 |
-| `journal_meta` | **无显式清理** | ❌ 残留在 DB 中（journal_id 仍指向已软删除的 journal） |
-| `budget_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
-| `category_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
-| `notes` | **无显式清理** | ❌ Note 记录残留 |
-| `tag_transaction_journal` | **无显式清理** | ❌ pivot 记录残留 |
-| `locations` | **无显式清理** | ❌ Location 记录残留 |
-| `piggy_bank_events` | **无显式清理** | ❌ 事件记录残留 |
+##### 观察器触发的精确条件
 
-**关键发现**：
+观察器在**任何**对 journal 调用 `$journal->delete()` 时触发，无论是：
 
-1. `$journal->delete()` 是**软删除**（`SoftDeletes` trait），不是物理删除。已软删除的 journal 在余额查询中被排除，所以**对余额计算无影响**
-2. 但子表数据（meta、pivot、notes、locations 等）**全部残留**在 DB 中，成为"软孤儿"
-3. 这些软孤儿不会影响功能正确性（因为关联查询都会 JOIN journal 并过滤 `deleted_at`），但会：
-   - 占用存储空间
-   - 在直接 SQL 查询或数据导出时产生困惑
-   - 在 journal 被恢复（`restore()`）时自动重新关联
+1. `JournalDestroyService::destroy()` 中的 `$journal->delete()`（forceDeleteOnError 路径）
+2. `DeletedTransactionGroupObserver::deleting()` 中的 `$journal->delete()`（group 删除级联路径）
+3. 用户手动删除交易的任何代码路径
 
-4. **forceDeleteOnError 的调用时机极其有限**：仅在 P6/P7 的 `catch (FireflyException $e)` 中被调用（见 10.6.2 节）。P8-P15 和 G2-G3 失败时**完全不会触发此清理逻辑**
+**但有一个前提**：journal 必须成功创建并持久化到数据库。如果 journal 根本不存在（如 P5 之前失败），观察器不会触发。
 
-#### 10.6.6 补偿交易创建失败场景的完整残留矩阵（修正版）
+##### DeletedTransactionGroupObserver 的级联删除链
 
-以下矩阵基于对账场景的实际代码路径，精确标注每个阶段失败后各数据表的状态：
+```php
+// DeletedTransactionGroupObserver.php 第 34-40 行
+public function deleting(TransactionGroup $transactionGroup): void
+{
+    foreach ($transactionGroup->transactionJournals()->get() as $journal) {
+        $journal->delete();    // 触发 DeletedTransactionJournalObserver
+    }
+}
+```
 
-| 失败阶段 | 异常类型 | 被 catch? | transaction_journals | transactions | journal_meta | pivot(budget/category/tag) | notes | locations | transaction_groups | STEP 1 对账标记 | 用户看到 |
-|---------|---------|----------|---------------------|-------------|-------------|---------------------------|-------|-----------|-------------------|----------------|---------|
-| P1~P4 | FireflyException | ✅ journal 层 catch | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
-| P5 | QueryException → FireflyException | ✅ journal 层 catch | ❌ 无（被 forceDelete 清理） | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
-| P6~P7 | FireflyException | ✅ journal 层 catch + 清理 | ❌ 无（被清理） | ❌ 无（被清理） | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | error flash |
-| P6~P7 | 非 FireflyException | ❌ 漏捕获 | ✅ 1 条(group_id=null) | ✅ 2 条 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| P8 | QueryException | ❌ 漏捕获 | ✅ 1 条(group_id=null) | ✅ 2 条 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| P9 | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ❌ 无 | ⚠️ budgets sync 已执行 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| P10 | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ❌ 无 | ⚠️ budgets+categories sync 已执行 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| P14 (meta) | QueryException | ❌ 漏捕获 | ✅ 1 条 | ✅ 2 条 | ⚠️ 部分（import_hash_v2 可能已写入） | ✅ P9-P10 已 sync | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| G2 | QueryException | ❌ 无 catch | ✅ 1 条(group_id=null) | ✅ 2 条 | ✅ 已写入 | ✅ 已 sync | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 已标记 | 500 + 孤儿交易 |
-| G3 | QueryException | ❌ 无 catch | ✅ 1 条(group_id=?) | ✅ 2 条 | ✅ 已写入 | ✅ 已 sync | ❌ 无 | ❌ 无 | ✅ 1 条(可能) | ✅ 已标记 | 500 + 可能部分关联 |
+**完整级联链**：
+```
+$group->delete()
+  └─ DeletedTransactionGroupObserver::deleting()
+       └─ foreach journals: $journal->delete()
+            └─ DeletedTransactionJournalObserver::deleting()
+                 ├─ transactions 软删除
+                 ├─ journal_links 物理删除
+                 ├─ piggy_bank_events 解绑
+                 ├─ budget/category/tag pivot 物理删除
+                 ├─ attachments 物理删除
+                 ├─ journal_meta 物理删除
+                 ├─ locations 物理删除
+                 ├─ notes 物理删除
+                 └─ audit_log_entries 物理删除
+```
+
+#### 10.6.6 三种清理场景的精确对比
+
+基于上述观察器机制，补偿交易创建失败后的清理效果取决于**是否触发了 journal 的 delete() 调用**。以下区分三种场景：
+
+##### 场景 A：forceDeleteOnError 路径（P6/P7 失败，FireflyException）
+
+调用链：`catch (FireflyException)` → `forceDeleteOnError($collection)` → `JournalDestroyService::destroy($journal)` → `$journal->delete()`
+
+```
+$journal->delete() 触发后：
+  └─ DeletedTransactionJournalObserver::deleting()
+       ├─ ✅ transactions: 软删除（WHERE deleted_at IS NULL 排除 → 余额不计数）
+       ├─ ✅ journal_meta: 物理删除
+       ├─ ✅ budget/category/tag pivot: 物理删除
+       ├─ ✅ notes: 物理删除
+       ├─ ✅ locations: 物理删除
+       ├─ ✅ journal_links: 物理删除
+       ├─ ✅ piggy_bank_events: 解绑（journal_id = null）
+       ├─ ✅ attachments: 物理删除
+       └─ ✅ audit_log_entries: 物理删除
+
+  journal->delete() 完成后（软删除）：
+  └─ JournalDestroyService::destroy() 继续检查 group
+       └─ 若 journal 的 group 存在且为空 → $group->delete()
+            └─ DeletedTransactionGroupObserver::deleting()
+                 └─ 遍历 group 下的 journals → 但已软删除的不在查询结果中
+                    → 通常 group 为空 → group 被软删除
+```
+
+**此场景结果**：journal + transactions 被软删除（记录在 DB 但不影响功能），所有附属数据被物理删除，**清理彻底**。
+
+##### 场景 B：group 关联失败（G2/G3 失败，异常直接冒泡）
+
+异常冒泡路径：G2/G3 抛出 QueryException → GroupFactory 无 catch → createReconciliation() 无 catch → submit() 无 catch → Laravel 500
+
+**关键问题**：异常冒泡过程中**没有任何代码调用 `$journal->delete()`**，所以 DeletedTransactionJournalObserver **根本不会触发**。
+
+```
+G2 失败（group 未创建）：
+  transaction_journals:    ✅ 1 条存活（transaction_group_id = null）
+  transactions:            ✅ 2 条存活
+  journal_meta:            ✅ 已写入的存活
+  budget/category pivot:   ✅ 已 sync 的存活
+  notes/locations/...:     依 P8-P15 进度而定
+
+G3 失败（group 已创建，关联未完成）：
+  transaction_groups:      ✅ 1 条存活
+  transaction_journals:    ✅ 1 条存活（transaction_group_id = ?）
+  transactions:            ✅ 2 条存活
+  journal_meta:            ✅ 已写入的存活
+  budget/category pivot:   ✅ 已 sync 的存活
+  notes/locations/...:     依 P8-P15 进度而定
+```
+
+**此场景结果**：journal 和 transactions **全量存活**在 DB 中，余额计算**包含**这些数据。附属数据视 P8-P15 进度部分存活。**无任何清理发生**。
+
+##### 场景 C：P8-P15 中间步骤失败（异常直接冒泡，无 journal delete）
+
+与场景 B 本质相同——异常冒泡过程中无人调用 `$journal->delete()`，观察器不触发。残留取决于失败发生在哪一步之后。
+
+```
+P8 失败：journal ✅ + 2 transactions ✅，其余全无
+P9 失败：+ budgets pivot ✅（sync 已执行）
+P10 失败：+ categories pivot ✅（sync 已执行）
+P14 失败：+ journal_meta 部分 ✅（import_hash_v2 等可能已写入）
+```
+
+**此场景结果**：journal 和 transactions **全量存活**，附属数据按步骤进度部分残留。**无任何清理发生**。
+
+##### 三种场景清理效果对比
+
+| 数据表 | 场景 A (forceDeleteOnError) | 场景 B (G2/G3 失败) | 场景 C (P8-P15 失败) |
+|-------|---------------------------|--------------------|--------------------|
+| `transaction_journals` | ⚠️ 软删除（不影响余额） | ✅ 存活（**影响余额**） | ✅ 存活（**影响余额**） |
+| `transactions` | ⚠️ 软删除（不影响余额） | ✅ 存活（**影响余额**） | ✅ 存活（**影响余额**） |
+| `journal_meta` | ✅ 物理删除 | ✅ 存活（视 P14 进度） | ✅ 部分存活 |
+| `budget_transaction_journal` | ✅ 物理删除 | ✅ 存活（视 P9 进度） | ✅ 部分存活 |
+| `category_transaction_journal` | ✅ 物理删除 | ✅ 存活（视 P10 进度） | ✅ 部分存活 |
+| `tag_transaction_journal` | ✅ 物理删除 | ❌ 无（P13 对账跳过） | ❌ 无（P13 对账跳过） |
+| `notes` | ✅ 物理删除 | ❌ 无（P11 对账跳过） | ❌ 无（P11 对账跳过） |
+| `locations` | ✅ 物理删除 | ❌ 无（P15 对账跳过） | ❌ 无（P15 对账跳过） |
+| `transaction_groups` | ✅ 清理（若为空则删） | ❌ 无（G2）/ ✅ 1 条（G3） | ❌ 无 |
+| `piggy_bank_events` | ✅ 解绑（journal_id=null） | ❌ 无（P12 对账跳过） | ❌ 无（P12 对账跳过） |
+| `attachments` | ✅ 物理删除 | ❌ 无（对账无附件） | ❌ 无（对账无附件） |
+| `audit_log_entries` | ✅ 物理删除 | ❌ 无（对账无审计日志） | ❌ 无（对账无审计日志） |
+
+**核心差异**：场景 A 中 `DeletedTransactionJournalObserver` 被触发，所有附属数据被**物理删除**；场景 B/C 中观察器**完全不触发**，journal 和 transactions 存活并影响余额。
+
+#### 10.6.7 补偿交易创建失败场景的完整残留矩阵（最终修正版）
+
+以下矩阵基于观察器级联删除机制的完整分析，重新评估每个失败场景的实际清理效果：
+
+| 失败阶段 | 异常类型 | 观察\器触发? | transaction_journals | transactions | journal_meta | pivot(bdgt/cat/tag) | transaction_groups | 余额影响 | 用户看到 |
+|---------|---------|-----------|---------------------|-------------|-------------|---------------------|-------------------|---------|---------|
+| P1~P4 | FireflyException | ❌ 无 journal | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | 无 | error flash |
+| P5 | QueryException → wrapped | ❌ 无 journal | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | 无 | error flash |
+| P6 | FireflyException | ✅ forceDelete → 触发 | ⚠️ 软删 | ⚠️ 软删 | ✅ 物理删 | ✅ 物理删 | ❌ 无 | **无影响** | error flash |
+| P7 | FireflyException | ✅ forceDelete → 触发 | ⚠️ 软删 | ⚠️ 软删 | ✅ 物理删 | ✅ 物理删 | ❌ 无 | **无影响** | error flash |
+| P6~P7 | 非 FireflyException | ❌ 无 delete 调用 | ✅ 存活 | ✅ 存活 | ❌ 无 | ❌ 无 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| P8 | QueryException | ❌ 无 delete 调用 | ✅ 存活 | ✅ 存活 | ❌ 无 | ❌ 无 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| P9 | QueryException | ❌ 无 delete 调用 | ✅ 存活 | ✅ 存活 | ❌ 无 | ⚠️ bdgt pivot 存活 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| P10 | QueryException | ❌ 无 delete 调用 | ✅ 存活 | ✅ 存活 | ❌ 无 | ⚠️ bdgt+cat pivot 存活 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| P14 (meta) | QueryException | ❌ 无 delete 调用 | ✅ 存活 | ✅ 存活 | ⚠️ 部分存活 | ✅ 已 sync 存活 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| G2 | QueryException | ❌ 无 delete 调用 | ✅ 存活(group_id=null) | ✅ 存活 | ✅ 已写入存活 | ✅ 已 sync 存活 | ❌ 无 | **余额被改** | 500 + 不可见交易 |
+| G3 | QueryException | ❌ 无 delete 调用 | ✅ 存活(group_id=?) | ✅ 存活 | ✅ 已写入存活 | ✅ 已 sync 存活 | ✅ 1 条(可能) | **余额被改** | 500 + 可能可见 |
 
 **最严重的一致性问题**：
 1. 无论 STEP 2 在哪一步失败，STEP 1 的对账标记都**已经持久化**，且永远不会被回滚
-2. P8-P15 和 G2/G3 失败产生的"孤儿 journal"（`transaction_group_id = null`）**不影响余额但不可见于 UI**，是最难发现的数据不一致
-3. P14 失败若导致 `import_hash_v2` 未写入，该 journal 将**永远不参与重复交易检测**，增加了重复创建的风险
+2. 场景 B/C 中（P8-P15、G2/G3、P6/P7 非 FireflyException），journal 和 transactions **全量存活**，余额被默默改变但 UI 上可能看不到对应交易（孤儿 journal 不可见于 group 查询）
+3. 只有场景 A（P6/P7 的 FireflyException）能通过观察器**彻底清理**附属数据——但此场景下 journal 和 transactions 仍以软删除形式保留在 DB 中（不影响功能但不彻底）
+4. P14 失败若导致 `import_hash_v2` 未写入，该 journal 将**永远不参与重复交易检测**，增加了重复创建的风险
+5. **观察器的 `withoutEvents` 包装**：第 46-50 行使用 `TransactionJournal::withoutEvents()` 来删除 transactions，这意味着 transaction 删除时**不会触发 TransactionObserver**——不会有 `updated`/`created` 事件的副作用（如汇率转换），但也不影响清理本身
 
 ---
 
