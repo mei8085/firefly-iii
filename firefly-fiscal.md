@@ -1004,7 +1004,410 @@ $result = view('reports.default.year', [
 | 短月边界测试 | [MonthlyTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/tests/unit/Support/Calendar/Periodicity/MonthlyTest.php#L48-L64) | L48-L64 |
 | 配置保存 | [PreferencesController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/PreferencesController.php#L296-L303) | L296-L303 |
 | 报表月份分组 | [ReportHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Report/ReportHelper.php#L102-L139) | L102-L139 |
-| 路由魔术词 | [Date.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L58-L61) | L58-L61 |
+| 路由魔术词 | [Date.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L42-L80) | L42-L80 |
 | 会话初始化 | [Range.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Middleware/Range.php#L121-L151) | L121-L151 |
 | 报表视图UI | [reports/index.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/resources/views/reports/index.twig#L70-L91) | L70-L91 |
 | 预算页面 | [Budget/IndexController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/Budget/IndexController.php#L95-L163) | L95-L163 |
+| Binder 中间件 | [Binder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Middleware/Binder.php#L61-L71) | L61-L71 |
+| 绑定配置 | [bindables.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/config/bindables.php#L100-L103) | L100-L103 |
+| 报表生成工厂 | [ReportGeneratorFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Generator/Report/ReportGeneratorFactory.php#L39-L63) | L39-L63 |
+| 年度报表生成 | [YearReportGenerator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Generator/Report/Standard/YearReportGenerator.php#L52-L74) | L52-L74 |
+| 时区配置 | [config/app.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/config/app.php#L43) | L43 |
+| 报表控制器入口 | [ReportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/ReportController.php#L164-L183) | L164-L183 |
+
+---
+
+## 十、深度专题：三个关键细节路径分析
+
+### 10.1 previousFiscalYearStart 闰年起始日的天数差异
+
+#### 10.1.1 两种计算方式的代码对比
+
+在 [Date.php#L60-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L60-L61) 中，`previousFiscalYearStart` 的实现是：
+
+```php
+'previousFiscalYearStart' => $fiscalHelper->startOfFiscalYear(today(config('app.timezone')))->subYear(),
+'previousFiscalYearEnd'   => $fiscalHelper->endOfFiscalYear(today(config('app.timezone')))->subYear(),
+```
+
+另一种可能的实现方式是：
+```php
+// 先减一年，再计算财年开始
+$alternative = $fiscalHelper->startOfFiscalYear(today(config('app.timezone'))->subYear());
+```
+
+#### 10.1.2 差异场景分析（财年起点 = 02-29）
+
+**场景：当前日期为 2024-03-15（闰年），财年起点设为 02-29**
+
+**方式 A：当前实现（先算财年开始，再减一年）**
+```
+1. today = 2024-03-15
+2. startOfFiscalYear(2024-03-15)
+   ├─ 设置 day=29, month=2 → 2024-02-29（闰年，存在）
+   ├─ 比较：2024-02-29 < 2024-03-15 → 不回退
+   └─ 结果：2024-02-29
+3. subYear() → 2023-02-29
+   └─ 2023是平年，2月29日不存在 → Carbon 溢出到 2023-03-01
+4. 最终结果：2023-03-01
+```
+
+**方式 B：先减一年，再算财年开始**
+```
+1. today = 2024-03-15
+2. subYear() → 2023-03-15
+3. startOfFiscalYear(2023-03-15)
+   ├─ 设置 day=29, month=2 → 2023-02-29（平年，不存在）
+   ├─ Carbon 溢出到 2023-03-01
+   ├─ 比较：2023-03-01 < 2023-03-15 → 不回退
+   └─ 结果：2023-03-01
+4. 最终结果：2023-03-01
+```
+
+**场景：当前日期为 2024-02-15（闰年，在财年起点之前）**
+
+**方式 A：当前实现**
+```
+1. today = 2024-02-15
+2. startOfFiscalYear(2024-02-15)
+   ├─ 设置 day=29, month=2 → 2024-02-29
+   ├─ 比较：2024-02-29 > 2024-02-15 → 回退1年
+   └─ 结果：2023-02-29
+3. subYear() → 2022-02-29
+   └─ 2022是平年 → 溢出到 2022-03-01
+4. 最终结果：2022-03-01
+```
+
+**方式 B：先减一年，再算财年开始**
+```
+1. today = 2024-02-15
+2. subYear() → 2023-02-15
+3. startOfFiscalYear(2023-02-15)
+   ├─ 设置 day=29, month=2 → 2023-02-29 → 溢出到 2023-03-01
+   ├─ 比较：2023-03-01 > 2023-02-15 → 回退1年
+   └─ 结果：2022-03-01
+4. 最终结果：2022-03-01
+```
+
+#### 10.1.3 差异对比表
+
+| 当前日期 | 财年起点 | 方式A结果 | 方式B结果 | 差异天数 |
+|----------|----------|-----------|-----------|----------|
+| 2024-03-15 (闰年，起点后) | 02-29 | 2023-03-01 | 2023-03-01 | 0天 |
+| 2024-02-15 (闰年，起点前) | 02-29 | 2022-03-01 | 2022-03-01 | 0天 |
+| 2024-02-29 (闰年，当天) | 02-29 | 2023-03-01 | 2023-03-01 | 0天 |
+| 2023-03-15 (平年，起点后) | 02-29 | 2022-03-01 | 2022-03-01 | 0天 |
+
+**结论**：对于闰日财年起点，两种计算方式的结果在所有场景下都一致，差异为 **0天**。
+
+**原因**：
+- 方式 A 的溢出发生在 `subYear()` 步骤（从闰年2月29日减到平年）
+- 方式 B 的溢出发生在 `startOfFiscalYear()` 步骤（平年设置2月29日）
+- 两者的 Carbon 溢出行为完全一致，最终都指向 3月1日
+- 跨年回退逻辑也保持一致
+
+#### 10.1.4 非闰日起点的对比验证
+
+对于非闰日财年起点（如 07-01），两种方式也完全一致：
+
+| 当前日期 | 财年起点 | 方式A结果 | 方式B结果 | 差异天数 |
+|----------|----------|-----------|-----------|----------|
+| 2024-03-15 | 07-01 | 2022-07-01 | 2022-07-01 | 0天 |
+| 2024-08-15 | 07-01 | 2023-07-01 | 2023-07-01 | 0天 |
+
+**设计选择分析**：当前实现选择"先算财年开始，再减一年"的方式，代码更简洁，且结果与"先减一年，再算财年开始"完全等价。
+
+---
+
+### 10.2 ReportHelper 自然季度分组的路径
+
+#### 10.2.1 季度链接的生成路径
+
+ReportHelper 本身**没有**季度分组方法。季度链接是在**视图层**直接硬编码的：
+
+文件：[reports/index.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/resources/views/reports/index.twig#L77-L82)
+
+```twig
+{% if customFiscalYear == 0 %}
+    (
+        <a href="#" class="date-select" data-start="{{ year }}-01-01" data-end="{{ year }}-03-31">Q1</a>,
+        <a href="#" class="date-select" data-start="{{ year }}-04-01" data-end="{{ year }}-06-30">Q2</a>,
+        <a href="#" class="date-select" data-start="{{ year }}-07-01" data-end="{{ year }}-09-30">Q3</a>,
+        <a href="#" class="date-select" data-start="{{ year }}-10-01" data-end="{{ year }}-12-31">Q4</a>
+    )
+{% endif %}
+```
+
+**季度数据来源**：`year` 变量来自 [ReportHelper.php#L113](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Report/ReportHelper.php#L113) 的 `listOfMonths()` 方法返回的数组键。
+
+#### 10.2.2 完整的季度数据流动路径
+
+```
+ReportController::index() [L220-L225]
+    ↓
+$this->helper->listOfMonths($start)  [ReportHelper.php#L102-L139]
+    ├─ 按财年对月份分组（键为财年结束年份）
+    ├─ 每个分组包含：
+    │   ├─ fiscal_start / fiscal_end（财年起止）
+    │   ├─ start / end（自然年起止，用于季度链接）
+    │   └─ months（月份列表）
+    └─ 返回 $months 数组
+    ↓
+视图 reports/index.twig 接收 $months
+    ├─ 遍历 $months，$year 为数组键（自然年份）
+    ├─ 显示自然年链接：data-start="{{ data.start }}" = {{ year }}-01-01
+    ├─ 显示财年链接（如果启用）：data-start="{{ data.fiscal_start }}"
+    └─ 显示季度链接（如果未启用自定义财年）：
+        ├─ Q1: {{ year }}-01-01 到 {{ year }}-03-31
+        ├─ Q2: {{ year }}-04-01 到 {{ year }}-06-30
+        ├─ Q3: {{ year }}-07-01 到 {{ year }}-09-30
+        └─ Q4: {{ year }}-10-01 到 {{ year }}-12-31
+```
+
+#### 10.2.3 季度日期的后端消费路径
+
+当用户点击季度链接后，日期通过以下路径处理：
+
+```
+用户点击 Q1 链接 → JavaScript 更新表单隐藏域
+    ↓
+表单提交 → ReportController::postIndex() [L291-L347]
+    ├─ $request->getStartDate() 解析 "2024-01-01"
+    ├─ $request->getEndDate() 解析 "2024-03-31"
+    └─ 重定向到：/reports/default/1/20240101/20240331
+    ↓
+路由匹配：reports.report.default
+    ├─ start_date 参数 = "20240101" → Date::routeBinder()
+    │   └─ new Carbon("20240101") → 2024-01-01
+    └─ end_date 参数 = "20240331" → Date::routeBinder()
+        └─ new Carbon("20240331") → 2024-03-31
+    ↓
+控制器注入：defaultReport(Collection $accounts, Carbon $start, Carbon $end)
+    ↓
+ReportGeneratorFactory::reportGenerator('Standard', $start, $end) [L39-L63]
+    ├─ 计算日期差：2024-01-01 到 2024-03-31 = 约 2.9 个月
+    ├─ diffInMonths > 1 → true
+    ├─ diffInMonths > 12 → false
+    └─ 选择 YearReportGenerator（而非 MonthReportGenerator）
+    ↓
+YearReportGenerator 渲染季度报表视图
+```
+
+#### 10.2.4 Navigation 中的季度计算
+
+当 `viewRange` 设置为 `'3M'` 时，Navigation 提供季度级别的计算：
+
+文件：[Navigation.php#L875](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L875) 和 [Navigation.php#L824](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L824)
+
+```php
+// updateStartDate
+$functionMap = [
+    '3M' => 'firstOfQuarter',  // Carbon 原生方法：自然季度开始
+];
+
+// updateEndDate
+$functionMap = [
+    '3M' => 'lastOfQuarter',   // Carbon 原生方法：自然季度结束
+];
+```
+
+**关键注意**：这些方法都是 Carbon 原生的自然季度计算，与财年设置完全无关。
+
+#### 10.2.5 ReportHelper 与季度的关系总结
+
+| 功能 | ReportHelper 参与 | 实现位置 |
+|------|-------------------|----------|
+| 生成年份分组（含自然年起止） | ✅ 参与 | [ReportHelper.php#L118-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Report/ReportHelper.php#L118-L119) |
+| 生成季度起止日期 | ❌ 不参与 | 视图层硬编码 |
+| 解析季度日期 | ❌ 不参与 | Date 绑定器 + ReportFormRequest |
+| 按季度计算报表 | ❌ 不参与 | YearReportGenerator（按日期跨度） |
+
+ReportHelper 的 `listOfMonths()` 只为季度链接提供了 `year` 变量和 `data.start` / `data.end` 作为参考，实际的季度起止日期完全是视图层通过字符串拼接生成的。
+
+---
+
+### 10.3 Range middleware setRange 的触发时机与时区错位复现
+
+#### 10.3.1 中间件注册顺序
+
+文件：[bootstrap/app.php#L129-L135](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/bootstrap/app.php#L129-L135)
+
+```php
+$middleware->appendToGroup('user-full-auth', [
+    Authenticate::class,      // 1. 用户认证
+    MFAMiddleware::class,     // 2. 双因素认证
+    Range::class,             // 3. 范围设置（setRange 在这里调用）
+    InterestingMessage::class,// 4. 消息提示
+]);
+```
+
+**web 组中间件顺序**（在 user-full-auth 之前执行）：
+```
+web 组：
+  1. EncryptCookies
+  2. AddQueuedCookiesToResponse
+  3. StartFireflyIIISession  ← 会话启动
+  4. ShareErrorsFromSession
+  5. VerifyCsrfToken
+  6. Binder                   ← 路由参数绑定（魔术词解析）
+  7. CreateFreshApiToken
+
+然后才是 user-full-auth 组：
+  1. Authenticate
+  2. MFAMiddleware
+  3. Range::handle() → setRange()
+  4. InterestingMessage
+```
+
+#### 10.3.2 setRange 的触发条件
+
+文件：[Range.php#L121-L151](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Middleware/Range.php#L121-L151)
+
+```php
+private function setRange(): void
+{
+    // 仅当会话中没有 start 和 end 时才执行
+    if (!app('session')->has('start') && !app('session')->has('end')) {
+        $viewRange = Preferences::get('viewRange', '1M')->data;
+        $today     = today(config('app.timezone'));              // 显式指定时区
+        $start     = Navigation::updateStartDate($viewRange, $today);
+        $end       = Navigation::updateEndDate($viewRange, $start);
+        
+        app('session')->put('start', $start);
+        app('session')->put('end', $end);
+    }
+    
+    // 仅当会话中没有 first 时才执行
+    if (!app('session')->has('first')) {
+        // 设置 first 日期（最早交易日期或本年初）
+    }
+}
+```
+
+**触发条件**：
+1. 用户已认证（通过 Authenticate 中间件）
+2. 会话中没有 `start` 和 `end` 变量
+3. 路由使用了 `user-full-auth` 或 `admin` 中间件组
+
+**不触发的情况**：
+- 会话已存在 `start` / `end`（大部分请求）
+- 用户未登录
+- 路由不包含 `user-full-auth` 中间件（如 API 路由、公开页面）
+- 保存偏好设置后（会清除会话，下次请求重新触发）
+
+#### 10.3.3 时区错位问题的复现路径
+
+要复现时区错位导致的跨年判断错误，需要满足以下**所有条件**：
+
+##### 条件 1：应用时区与 PHP 默认时区不一致
+
+```env
+# .env
+TZ=Asia/Shanghai  # 应用时区 = UTC+8
+```
+
+但 PHP 默认时区仍为 UTC（Laravel 通常会统一设置，但如果被其他代码修改）。
+
+##### 条件 2：财年开始日期为 01-01，且当前日期接近跨年边界
+
+当前时间：**2023-12-31 23:30:00 (Asia/Shanghai)** = **2023-12-31 15:30:00 (UTC)**
+
+##### 条件 3：两个日期对象来自不同的创建方式
+
+```php
+// 方式 A：显式指定时区（来自 setRange）
+$today = today(config('app.timezone'));  
+// 结果：2023-12-31 00:00:00 Asia/Shanghai 
+//      = 2023-12-30 16:00:00 UTC
+
+// 方式 B：不显式指定时区（来自魔术词解析的日期字符串）
+$date = new Carbon('2023-12-31');  
+// 结果：2023-12-31 00:00:00 UTC 
+//      = 2023-12-31 08:00:00 Asia/Shanghai
+
+// 在 FiscalHelper::startOfFiscalYear 中比较
+$startDate = clone $date;  // 继承 $date 的时区
+$startDate->day(1)->month(1);  // 2023-01-01 UTC
+
+if ($startDate > $date) {  // 2023-01-01 UTC > 2023-12-31 UTC ? → false
+    $startDate->subYear(); // 不执行
+}
+```
+
+##### 真实复现场景（跨年边界）
+
+**配置**：
+- 应用时区：`Asia/Shanghai` (UTC+8)
+- 财年开始：`01-01`
+- PHP 默认时区：`UTC`（假设未被正确设置）
+
+**场景**：用户在北京时间 2024-01-01 01:00:00 访问页面
+
+```
+请求时间：2024-01-01 01:00:00 Asia/Shanghai = 2023-12-31 17:00:00 UTC
+
+1. Range 中间件 setRange() 触发
+   ├─ $today = today(config('app.timezone')) 
+   │  → 2024-01-01 00:00:00 Asia/Shanghai
+   │  = 2023-12-31 16:00:00 UTC
+   ├─ viewRange = '1Y'
+   └─ Navigation::updateStartDate('1Y', $today)
+       └─ FiscalHelper::startOfFiscalYear($today)
+           ├─ $startDate = clone $today  // 2024-01-01 Asia/Shanghai
+           ├─ 设置 day=1, month=1      // 2024-01-01 Asia/Shanghai
+           └─ 比较：2024-01-01 > 2024-01-01？→ false，不回退
+           └─ 结果：2024-01-01 Asia/Shanghai ✓
+
+2. 同时，用户点击了一个日期链接：20231231
+   └─ Date::routeBinder('20231231', $route)
+       └─ new Carbon('20231231')  // 2023-12-31 00:00:00 UTC
+                                   = 2023-12-31 08:00:00 Asia/Shanghai
+       ↓
+   控制器收到：$start = 2023-12-31 UTC
+   
+3. 报表生成时调用 FiscalHelper::startOfFiscalYear($start)
+   ├─ $startDate = clone $start  // 2023-12-31 UTC
+   ├─ 设置 day=1, month=1      // 2023-01-01 UTC
+   └─ 比较：2023-01-01 UTC > 2023-12-31 UTC？→ false ✓
+```
+
+**实际复现困难的原因**：
+
+1. **Laravel 统一设置时区**：在 `bootstrap/app.php` 或 `AppServiceProvider` 中通常会调用 `date_default_timezone_set(config('app.timezone'))`，确保 PHP 默认时区与应用一致。
+
+2. **Carbon 比较会转换时区**：当比较两个不同时区的 Carbon 对象时，Carbon 会先转换为相同时区再比较。
+
+3. **日期通常在同一天内**：跨年判断通常比较的是日期部分，而非时间部分。
+
+4. **会话缓存**：setRange 只在第一次请求时执行，后续请求使用会话中已缓存的日期。
+
+##### 理论上可复现的极端场景
+
+**配置**：
+- 应用时区：`Pacific/Apia` (UTC+13, 跨国际日期变更线)
+- 财年开始：`01-01`
+- PHP 默认时区：`UTC`
+- 手动修改 PHP 默认时区（通过代码注入）
+
+**复现步骤**：
+1. 在 `AppServiceProvider` 之后但 `Range` 中间件之前，执行 `date_default_timezone_set('UTC')`
+2. 用户在当地时间 2024-01-01 01:00:00 (Pacific/Apia) 访问
+   - UTC 时间：2023-12-31 12:00:00
+3. setRange 中 `today(config('app.timezone'))` 创建 2024-01-01 Pacific/Apia
+4. 另一个日期通过 `new Carbon('2023-12-31')` 创建，使用 UTC 时区
+5. 在财年判断中可能出现预期外的回退行为
+
+**结论**：时区错位问题在理论上存在，但在实际部署中由于 Laravel 的时区统一机制，**很难自然复现**。只有在时区配置被显式破坏的极端情况下才可能发生。
+
+#### 10.3.4 清除会话强制重新触发 setRange
+
+文件：[PreferencesController.php#L264-L266](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/PreferencesController.php#L264-L266)
+
+```php
+// 保存偏好设置后清除日期会话
+session()->forget('start');
+session()->forget('end');
+session()->forget('range');
+```
+
+这确保用户修改财年设置后，下次请求会重新计算日期范围。
