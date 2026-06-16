@@ -912,7 +912,7 @@ class WarnAboutBills implements ShouldQueue
 
 > 这意味着在默认配置下，虽然 WarnAboutBills 实现了 ShouldQueue，但实际是同步执行的。只有配置了外部队列驱动（如 redis）才会真正异步。
 
-### 8.5 第三层：WarnAboutBills Job 主体
+### 8.8 第三层：WarnAboutBills Job 主体
 
 在 [WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php#L77-L103) 的 `handle()` 方法中：
 
@@ -1159,14 +1159,23 @@ class SubscriptionsOverdueReminder extends Notification
 | [CronController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Api/V1/Controllers/System/CronController.php) | API 调度入口：/api/v1/cron |
 | [Cron.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Console/Commands/Tools/Cron.php) | Artisan 命令入口：php artisan firefly-iii:cron |
 | [CronRunner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/HttpControllers/CronRunner.php) | 通用 Cron 运行 Trait，各入口共用 |
+| [AbstractCronjob.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Cronjobs/AbstractCronjob.php) | Cronjob 抽象基类（$timeBetweenRuns = 43_200） |
 | [BillWarningCronjob.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Cronjobs/BillWarningCronjob.php) | 账单提醒 Cronjob（12小时节流控制） |
 | [WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php) | 账单提醒 Job 主体（检测逾期+到期，发送事件） |
+| [Job.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/Job.php) | Job 抽象基类（只有 Queueable trait） |
 | **逾期事件与通知通道** | |
 | [SubscriptionsAreOverdueForPayment.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Events/Model/Subscription/SubscriptionsAreOverdueForPayment.php) | 账单逾期事件定义 |
 | [NotifiesAboutOverdueSubscriptions.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php) | 逾期监听器（去重+偏好检查+发送通知） |
 | [NotificationSender.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/NotificationSender.php) | 统一通知发送器（错误处理+语言设置） |
 | [SubscriptionsOverdueReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/SubscriptionsOverdueReminder.php) | 逾期提醒通知类（mail/pushover/slack 通道） |
-| [BillReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/BillReminder.php) | 到期/续期提醒通知类（相同通道） |
+| [ReturnsAvailableChannels.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/ReturnsAvailableChannels.php) | 动态返回用户可用的通知通道 |
+| **到期/续期事件与通知通道** | |
+| [SubscriptionNeedsExtensionOrRenewal.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Events/Model/Subscription/SubscriptionNeedsExtensionOrRenewal.php) | 订阅到期/续期事件定义 |
+| [NotifiesAboutExtensionOrRenewal.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php) | 到期监听器（偏好检查+发送通知） |
+| [BillReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/BillReminder.php) | 到期/续期提醒通知类（mail/pushover/slack 通道） |
+| **配置文件** | |
+| [firefly.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/firefly.php#L225) | 应用配置（bill_reminder_periods = [90,30,14,7,0]） |
+| [queue.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php) | 队列配置（sync/database/redis 等驱动，retry_after = 90） |
 | **收支预测呈现** | |
 | [BasicController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Api/V1/Controllers/Summary/BasicController.php#L515-L523) | 首页汇总 API（bills-paid-in / bills-unpaid-in） |
 | [BillController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Http/Controllers/Chart/BillController.php#L68-L69) | 账单饼图控制器 |
