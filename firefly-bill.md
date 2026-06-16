@@ -1,4 +1,4 @@
-# Firefly III 账单系统代码分析
+﻿# Firefly III 账单系统代码分析
 
 ## 一、账单匹配规则的判定
 
@@ -889,28 +889,90 @@ public int $timeBetweenRuns = 43_200;  // 12 小时 = 12 * 3600
 
 配合内部 12 小时节流机制，效果是：系统每 5 分钟触发一次检查，但账单提醒任务实际每 12 小时最多执行一次。
 
-### 8.7 队列执行情况
+### 8.7 两类核心异步任务的 Queue 与 Retry 配置
 
-[WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php#L44) 类实现了 `ShouldQueue` 接口：
+账单链路中最核心的两个异步监听器都只 `implements ShouldQueue`，**没有任何自定义队列配置**，全部依赖 Laravel 默认值。
+
+#### 8.7.1 ProcessesNewTransactionGroup（交易处理监听器）
+
+文件：[ProcessesNewTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php#L25-L36)
 
 ```php
-class WarnAboutBills implements ShouldQueue
+namespace FireflyIII\Listeners\Model\TransactionGroup;
+
+use FireflyIII\Enums\WebhookTrigger;
+use FireflyIII\Events\Model\TransactionGroup\CreatedSingleTransactionGroup;
+use FireflyIII\Events\Model\TransactionGroup\UserRequestedBatchProcessing;
+use FireflyIII\Repositories\Journal\JournalRepositoryInterface;
+use FireflyIII\Support\Facades\FireflyConfig;
+use Illuminate\Contracts\Queue\ShouldQueue;  // ← 只有这个标记接口
+use Illuminate\Support\Facades\Log;
+
+// ⚠️ 没有任何队列/重试属性，也没有 use Queueable trait
+// 没有：$connection / $queue / $tries / $backoff
+// 没有：retryUntil() / failed() / InteractsWithQueue
+class ProcessesNewTransactionGroup implements ShouldQueue
 {
-    use Dispatchable;
-    use InteractsWithQueue;
-    use Queueable;
-    use SerializesModels;
-    // 没有自定义 $connection / $queue / $tries / $backoff
+    use SupportsGroupProcessingTrait;  // 只引入了业务逻辑 trait
+
+    public function handle(CreatedSingleTransactionGroup|UserRequestedBatchProcessing $event): void
+    {
+        // 业务逻辑：processRules / recalculateCredit / fireWebhooks ...
+    }
 }
 ```
 
-**队列配置：**
-- **连接（connection）**：使用默认连接 `QUEUE_CONNECTION`（默认 `sync`，可配 database/redis/beanstalkd 等）
-- **队列（queue）**：使用默认队列名 `default`
-- **重试策略**：未显式配置 `$tries`，依赖连接的 `retry_after`（database/redis 默认为 90 秒）
-- **同步模式**：当 `QUEUE_CONNECTION=sync` 时（默认），Job 会**同步执行**，不进入队列
+#### 8.7.2 NotifiesAboutOverdueSubscriptions（逾期通知监听器）
 
-> 这意味着在默认配置下，虽然 WarnAboutBills 实现了 ShouldQueue，但实际是同步执行的。只有配置了外部队列驱动（如 redis）才会真正异步。
+文件：[NotifiesAboutOverdueSubscriptions.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php#L25-L35)
+
+```php
+namespace FireflyIII\Listeners\Model\Subscription;
+
+use FireflyIII\Events\Model\Subscription\SubscriptionsAreOverdueForPayment;
+use FireflyIII\Notifications\NotificationSender;
+use FireflyIII\Notifications\User\SubscriptionsOverdueReminder;
+use FireflyIII\Support\Facades\Preferences;
+use Illuminate\Contracts\Queue\ShouldQueue;   // ← 同样只有这个
+use Illuminate\Support\Facades\Log;
+
+// ⚠️ 结构与 ProcessesNewTransactionGroup 完全一致
+// 没有：$connection / $queue / $tries / $backoff
+// 没有：retryUntil() / failed()
+class NotifiesAboutOverdueSubscriptions implements ShouldQueue
+{
+    public function handle(SubscriptionsAreOverdueForPayment $event): void
+    {
+        // 业务逻辑：去重检查 + 偏好检查 + 发送通知 ...
+    }
+}
+```
+
+#### 8.7.3 队列配置对照表
+
+两个类的实际队列行为**完全相同**，全部来自 [queue.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php) 全局默认值：
+
+| 配置项 | 值 | 来源 | 说明 |
+|--------|----|------|------|
+| connection | `env('QUEUE_CONNECTION', 'sync')` | [queue.php L37](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php#L37) | 默认 sync 同步执行 |
+| queue | `'default'` | [queue.php L60](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php#L60) | database/redis 驱动下的默认队列名 |
+| tries | 无限制（Laravel 默认） | 类未设置 `$tries` | 理论上无限重试直到成功或超时 |
+| backoff | 0 秒（Laravel 默认） | 类未设置 `$backoff` | 失败后立即重试，无退避 |
+| retry_after | 90 秒 | [queue.php L61](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php#L61) | 非 sync 驱动下，任务执行超过 90 秒视为失败重新入队 |
+| failed_job | `failed_jobs` 表 | [queue.php L102-L106](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/config/queue.php#L102-L106) | 最终失败后写入失败队列表 |
+
+> **关键提示：** `ShouldQueue` 在 Laravel 中只是一个空的「标记接口」，不提供任何配置。队列配置有三层来源：① 类级属性 `$connection/$queue/$tries`（Firefly III 未设置） ② 全局 `config/queue.php`（Firefly III 只有这一层） ③ 消费进程参数 `--tries=3 --queue=high`（外部部署时指定）。
+
+#### 8.7.4 四类任务队列配置汇总
+
+| 类 | 类型 | connection | queue | tries | backoff | retry_after |
+|----|------|-----------|-------|-------|---------|-------------|
+| ProcessesNewTransactionGroup | Listener | 默认(sync) | default | 不限 | 0s | 90s |
+| NotifiesAboutOverdueSubscriptions | Listener | 默认(sync) | default | 不限 | 0s | 90s |
+| NotifiesAboutExtensionOrRenewal | Listener | 默认(sync) | default | 不限 | 0s | 90s |
+| WarnAboutBills | Job | 默认(sync) | default | 不限 | 0s | 90s |
+
+**结论：** Firefly III 的所有队列任务都使用**同一套默认配置**，没有按优先级划分多队列，也没有自定义重试策略。默认 `QUEUE_CONNECTION=sync` 下全部同步执行，不会真正进入队列。
 
 ### 8.8 第三层：WarnAboutBills Job 主体
 
@@ -950,7 +1012,7 @@ public function handle(): void
 }
 ```
 
-### 8.6 两种提醒类型
+### 8.9 两种提醒类型
 
 | 类型 | 触发条件 | 对应事件 | 适用场景 |
 |------|----------|----------|----------|
@@ -999,7 +1061,7 @@ class SubscriptionsAreOverdueForPayment extends Event
 }
 ```
 
-### 9.3 监听器：去重与偏好检查
+### 9.3 逾期监听器：去重与偏好检查
 
 在 [NotifiesAboutOverdueSubscriptions.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php#L35-L82) 中：
 
@@ -1050,7 +1112,68 @@ class NotifiesAboutOverdueSubscriptions implements ShouldQueue  // 异步队列
 
 **去重机制的关键设计：** 使用 `bill_id + pay_dates 哈希` 作为 key。如果用户在同一周期内多次运行 cron，不会重复收到提醒；但到了下一个周期（pay_dates 变化），会生成新的 key 触发新提醒。
 
-### 9.4 通知发送器：NotificationSender
+
+### 9.4 到期监听器：偏好检查（无去重）
+
+与逾期监听器同级，处理 SubscriptionNeedsExtensionOrRenewal 事件的是 [NotifiesAboutExtensionOrRenewal.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php#L25-L52)。
+
+`php
+namespace FireflyIII\Listeners\Model\Subscription;
+
+use FireflyIII\Events\Model\Subscription\SubscriptionNeedsExtensionOrRenewal;
+use FireflyIII\Notifications\NotificationSender;
+use FireflyIII\Notifications\User\BillReminder;
+use FireflyIII\Support\Facades\Preferences;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Support\Facades\Log;
+
+class NotifiesAboutExtensionOrRenewal implements ShouldQueue
+{
+    public function handle(SubscriptionNeedsExtensionOrRenewal $event): void
+    {
+        Log::debug(sprintf('Now in %s', __METHOD__));
+        $subscription = $event->subscription;
+
+        // 1. 去重检查  无
+        //    bill_reminder_periods = [90,30,14,7,0] 是离散天数点
+        //    同一个 diff 在生命周期内只会命中一次，天然去重
+
+        // 2. 偏好检查：与逾期同一个 notification_bill_reminder key
+        /** @var bool $preference */
+        $preference = Preferences::getForUser(
+            $subscription->user,
+            'notification_bill_reminder',
+            true
+        )->data;
+
+        if (true === $preference) {
+            Log::debug('Subscription reminder is true!');
+            // 3. 发送单条 BillReminder 通知
+            NotificationSender::send(
+                $subscription->user,
+                new BillReminder($subscription, $event->field, $event->diff)
+            );
+            return;
+        }
+        Log::debug('User has disabled subscription reminders.');
+    }
+}
+`
+
+**与 9.3 逾期监听器对照：**
+
+| 项目 | 逾期（NotifiesAboutOverdueSubscriptions） | 到期（NotifiesAboutExtensionOrRenewal） |
+|------|-------------------------------------------|-----------------------------------------|
+| 事件类 | SubscriptionsAreOverdueForPayment | SubscriptionNeedsExtensionOrRenewal |
+| 去重机制 | 有（preferences key + pay_dates 哈希） | 无（离散命中天然不重复） |
+| 偏好 key | 
+otification_bill_reminder | 同一个 key |
+| 批量/单条 | 批量（多账单一次通知） | 单条（每账单每天数点一次） |
+| 通知类 | SubscriptionsOverdueReminder | BillReminder |
+| ShouldQueue | 是 | 是 |
+| 自定义队列配置 | 无 | 无 |
+
+### 9.5 通知发送器：NotificationSender
 
 在 [NotificationSender.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/NotificationSender.php#L36-L68) 中：
 
@@ -1073,9 +1196,9 @@ class NotificationSender
 }
 ```
 
-### 9.5 通知类与可用通道
+### 9.6 通知类与可用通道
 
-#### SubscriptionsOverdueReminder (逾期提醒)
+#### 9.6.1 SubscriptionsOverdueReminder (逾期提醒)
 
 在 [SubscriptionsOverdueReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/SubscriptionsOverdueReminder.php#L36-L126) 中：
 
@@ -1117,11 +1240,141 @@ class SubscriptionsOverdueReminder extends Notification
 }
 ```
 
-#### BillReminder (到期/续期提醒)
+#### 9.6.2 BillReminder (到期/续期提醒)
 
-在 [BillReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/BillReminder.php#L39-L120) 中用于 `SubscriptionNeedsExtensionOrRenewal` 事件，通道与逾期提醒相同。
+在 [BillReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/BillReminder.php#L39-L120) 中用于 `SubscriptionNeedsExtensionOrRenewal` 事件。
 
-### 9.6 可用通道对比
+构造函数接收三个参数：账单对象、字段名（`next_expected_match` 或 `end_of_period`）、diff 天数。
+
+```php
+class BillReminder extends Notification
+{
+    use Queueable;
+
+    public function __construct(private Bill $bill, private string $field, private int $diff)
+    {
+    }
+```
+
+**六个方法对照表：**
+
+| 方法 | 作用 | 返回类型 |
+|------|------|----------|
+| `via()` | 动态选择通知通道 | array |
+| `toMail()` | 邮件通道内容 | MailMessage |
+| `toPushover()` | Pushover 推送内容 | PushoverMessage |
+| `toSlack()` | Slack 消息内容 | SlackMessage |
+| `toNtfy()` | Ntfy 推送（注释中） | - |
+| `getSubject()` | 私有方法：生成标题 | string |
+
+下面是各方法的独立代码块。
+
+---
+
+**方法一：via()  通道选择**
+
+与逾期提醒共用同一套动态通道选择逻辑。
+
+```php
+// via() 方法
+public function via(User $notifiable): array
+{
+    return ReturnsAvailableChannels::returnChannels('user', $notifiable);
+}
+```
+
+---
+
+**方法二：toMail()  邮件通道**
+
+使用 `emails.bill-warning` markdown 模板，传入 field、diff、bill 三个变量。
+
+```php
+// toMail() 方法
+public function toMail(User $notifiable): MailMessage
+{
+    return (new MailMessage())
+        ->markdown(
+            'emails.bill-warning',
+            [
+                'field' => $this->field,
+                'diff'  => $this->diff,
+                'bill'  => $this->bill,
+            ]
+        )
+        ->subject($this->getSubject());
+}
+```
+
+---
+
+**方法三：toPushover()  Pushover 推送通道**
+
+调用 `trans('email.bill_warning_please_action')` 获取正文，标题调用 getSubject()。
+
+```php
+// toPushover() 方法
+public function toPushover(User $notifiable): PushoverMessage
+{
+    return PushoverMessage::create((string) trans('email.bill_warning_please_action'))
+        ->title($this->getSubject());
+}
+```
+
+---
+
+**方法四：toSlack()  Slack 通道**
+
+warning 级别，附件中包含"查看账单"的链接（route('bills.show')）。
+
+```php
+// toSlack() 方法
+public function toSlack(User $notifiable): SlackMessage
+{
+    $url = route('bills.show', [$this->bill->id]);
+
+    return (new SlackMessage())
+        ->warning()
+        ->attachment(
+            function ($attachment) use ($url) {
+                $attachment->title(trans('firefly.visit_bill', ['name' => $this->bill->name]), $url);
+            }
+        )
+        ->content($this->getSubject());
+}
+```
+
+---
+
+**方法五：toNtfy()  Ntfy 通道（注释中）**
+
+与 SubscriptionsOverdueReminder 相同，ntfy 通道代码已写但暂未启用，被注释包裹。
+
+---
+
+**方法六：getSubject()  私有方法生成标题**
+
+根据 diff 是否为 0 选择不同的翻译键，0 表示"今天到期"，非 0 表示"还有 X 天到期"。field 参数决定是 "next_expected_match" 还是 "end_of_period"。
+
+```php
+// getSubject() 私有方法
+private function getSubject(): string
+{
+    if (0 === $this->diff) {
+        return (string) trans(
+            sprintf('email.bill_warning_subject_now_%s', $this->field),
+            ['name' => $this->bill->name, 'diff' => $this->diff]
+        );
+    }
+
+    return (string) trans(
+        sprintf('email.bill_warning_subject_%s', $this->field),
+        ['name' => $this->bill->name, 'diff' => $this->diff]
+    );
+}
+```
+
+### 9.7 可用通道对比
 
 | 通道 | 对应方法 | 依赖包 | 说明 |
 |------|----------|--------|------|
