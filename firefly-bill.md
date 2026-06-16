@@ -821,12 +821,12 @@ if ($doAll || $this->option('send-subscription-warnings')) {
 ```php
 public function fire(): void
 {
-    // 1. 读取上次运行时间
+    // 1. 读取上次运行时间（firefly_configurations 表）
     $config = FireflyConfig::get('last_bw_job', 0);
     $lastTime = (int) $config->data;
     $diff = now()->timestamp - $lastTime;
     
-    // 2. 43200秒 = 12小时内不重复运行（除非 --force）
+    // 2. 43_200 秒 = 12 小时内不重复运行（除非 --force）
     if ($lastTime > 0 && $diff <= 43_200 && !$this->force) {
         $this->jobFired = false;
         $this->message = 'It has been %s since the cron-job has fired...';
@@ -842,6 +842,75 @@ public function fire(): void
 ```
 
 **设计意图：** 防止用户频繁调用 API 导致重复提醒。12小时内只会实际执行一次。
+
+### 8.5 节流阈值的由来与各 Cronjob 对比
+
+节流阈值定义在基类 [AbstractCronjob.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Cronjobs/AbstractCronjob.php#L38) 中：
+
+```php
+public int $timeBetweenRuns = 43_200;  // 12 小时 = 12 * 3600
+```
+
+各 Cronjob 的节流配置对比：
+
+| Cronjob | 配置键名 | 节流阈值 | 说明 |
+|---------|----------|----------|------|
+| BillWarningCronjob | `last_bw_job` | 43_200 秒（12h） | 账单提醒 |
+| RecurringCronjob | `last_rt_job` | 43_200 秒（12h） | 定期交易生成 |
+| AutoBudgetCronjob | `last_ab_job` | 43_200 秒（12h） | 自动预算 |
+| ExchangeRatesCronjob | `last_cer_job` | 43_200 秒（12h） | 汇率下载 |
+| WebhookCronjob | `last_webhook_job` | 600 秒（10min） | Webhook 发送（频率更高） |
+
+**注意：** 虽然基类定义了 `$timeBetweenRuns`，但每个具体 Cronjob 是**各自硬编码**实现节流逻辑的，没有复用基类变量（除 Webhook 外都是 43200）。
+
+### 8.6 Laravel Schedule 与外部 Cron 的说明
+
+**Firefly III 不使用 Laravel 内置的 Schedule 调度器。**
+
+代码中**没有** `app/Console/Kernel.php` 的 `schedule()` 方法注册，也没有在任何 ServiceProvider 中使用 `Schedule` facade。
+
+**实际调度方式：** 依赖**外部系统级 cron** 触发，有两种调用入口：
+
+```
+系统 cron（Linux crontab / Docker cron）
+    │
+    ├── 调用 CLI：  php artisan firefly-iii:cron
+    │               └── Cron::handle()
+    │
+    └── 调用 HTTP： GET /api/v1/cron?token=xxx
+                    └── CronController::cron()
+```
+
+**推荐的 cron 表达式（官方文档）：** 每 5 分钟运行一次
+
+```
+*/5 * * * * cd /path-to-firefly && php artisan firefly-iii:cron >> /dev/null 2>&1
+```
+
+配合内部 12 小时节流机制，效果是：系统每 5 分钟触发一次检查，但账单提醒任务实际每 12 小时最多执行一次。
+
+### 8.7 队列执行情况
+
+[WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php#L44) 类实现了 `ShouldQueue` 接口：
+
+```php
+class WarnAboutBills implements ShouldQueue
+{
+    use Dispatchable;
+    use InteractsWithQueue;
+    use Queueable;
+    use SerializesModels;
+    // 没有自定义 $connection / $queue / $tries / $backoff
+}
+```
+
+**队列配置：**
+- **连接（connection）**：使用默认连接 `QUEUE_CONNECTION`（默认 `sync`，可配 database/redis/beanstalkd 等）
+- **队列（queue）**：使用默认队列名 `default`
+- **重试策略**：未显式配置 `$tries`，依赖连接的 `retry_after`（database/redis 默认为 90 秒）
+- **同步模式**：当 `QUEUE_CONNECTION=sync` 时（默认），Job 会**同步执行**，不进入队列
+
+> 这意味着在默认配置下，虽然 WarnAboutBills 实现了 ShouldQueue，但实际是同步执行的。只有配置了外部队列驱动（如 redis）才会真正异步。
 
 ### 8.5 第三层：WarnAboutBills Job 主体
 
@@ -1069,12 +1138,37 @@ class SubscriptionsOverdueReminder extends Notification
 
 | 文件 | 作用 |
 |------|------|
+| **账单核心模型与计算** | |
 | [Bill.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Models/Bill.php) | 账单模型，定义字段和关系 |
-| [BillDateCalculator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Models/BillDateCalculator.php) | 账单日期计算器 |
-| [BillRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Repositories/Bill/BillRepository.php) | 账单仓储，业务逻辑 |
-| [SubscriptionEnrichment.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php) | 账单数据富集 |
-| [LinkToBill.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/TransactionRules/Actions/LinkToBill.php) | 链接账单规则动作 |
-| [WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php) | 账单提醒任务 |
-| [Navigation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Navigation.php) | 周期导航工具 |
-| [UpgradesBillsToRules.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Console/Commands/Upgrade/UpgradesBillsToRules.php) | 账单规则迁移（理解匹配规则的关键） |
+| [BillDateCalculator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Models/BillDateCalculator.php) | 新版账单日期计算器（富集层使用） |
+| [BillRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Repositories/Bill/BillRepository.php) | 旧版账单仓储（含 nextDateMatch/nextExpectedMatch） |
+| [Navigation.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Navigation.php) | 周期导航工具（addPeriod/diffInPeriods） |
+| [SubscriptionEnrichment.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php) | 账单数据富集层（pay_dates/paid_dates 计算） |
 | [BillTransformer.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Transformers/BillTransformer.php) | 账单数据转换器 |
+| **规则引擎（store-journal → LinkToBill）** | |
+| [TransactionGroupRepository.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L341-L372) | 交易存储入口，触发 CreatedSingleTransactionGroup 事件 |
+| [ProcessesNewTransactionGroup.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/TransactionGroup/ProcessesNewTransactionGroup.php) | 新交易监听器（异步队列） |
+| [SupportsGroupProcessingTrait.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/TransactionGroup/SupportsGroupProcessingTrait.php#L29-L66) | processRules() 启动规则引擎 |
+| [SearchRuleEngine.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php) | 规则引擎实现，执行触发器+动作 |
+| [LinkToBill.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/TransactionRules/Actions/LinkToBill.php) | link_to_bill 规则动作（设置 bill_id） |
+| [UpgradesBillsToRules.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Console/Commands/Upgrade/UpgradesBillsToRules.php) | 账单规则迁移（理解匹配规则构成的关键） |
+| **账单变更同步规则** | |
+| [BillUpdateService.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Services/Internal/Update/BillUpdateService.php#L114) | 账单更新服务，触发 UpdatedExistingBill 事件 |
+| [UpdatesRulesForChangedBill.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Bill/UpdatesRulesForChangedBill.php) | 账单名称变更时同步更新规则触发器和动作 |
+| **Cron 调度入口** | |
+| [CronController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Api/V1/Controllers/System/CronController.php) | API 调度入口：/api/v1/cron |
+| [Cron.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Console/Commands/Tools/Cron.php) | Artisan 命令入口：php artisan firefly-iii:cron |
+| [CronRunner.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/HttpControllers/CronRunner.php) | 通用 Cron 运行 Trait，各入口共用 |
+| [BillWarningCronjob.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Support/Cronjobs/BillWarningCronjob.php) | 账单提醒 Cronjob（12小时节流控制） |
+| [WarnAboutBills.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Jobs/WarnAboutBills.php) | 账单提醒 Job 主体（检测逾期+到期，发送事件） |
+| **逾期事件与通知通道** | |
+| [SubscriptionsAreOverdueForPayment.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Events/Model/Subscription/SubscriptionsAreOverdueForPayment.php) | 账单逾期事件定义 |
+| [NotifiesAboutOverdueSubscriptions.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php) | 逾期监听器（去重+偏好检查+发送通知） |
+| [NotificationSender.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/NotificationSender.php) | 统一通知发送器（错误处理+语言设置） |
+| [SubscriptionsOverdueReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/SubscriptionsOverdueReminder.php) | 逾期提醒通知类（mail/pushover/slack 通道） |
+| [BillReminder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Notifications/User/BillReminder.php) | 到期/续期提醒通知类（相同通道） |
+| **收支预测呈现** | |
+| [BasicController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Api/V1/Controllers/Summary/BasicController.php#L515-L523) | 首页汇总 API（bills-paid-in / bills-unpaid-in） |
+| [BillController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Http/Controllers/Chart/BillController.php#L68-L69) | 账单饼图控制器 |
+| [IndexController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Http/Controllers/Bill/IndexController.php) | 账单列表页控制器 |
+| [ReportHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/99-firefly-iii/app/Helpers/Report/ReportHelper.php#L63) | 报表中预期日期列生成 |
