@@ -1273,23 +1273,70 @@ YearReportGenerator 渲染季度报表视图
 
 #### 10.2.4 Navigation 中的季度计算
 
-当 `viewRange` 设置为 `'3M'` 时，Navigation 提供季度级别的计算：
+当 `viewRange` 设置为 `'3M'` 时，Navigation 提供季度级别的计算。
 
-文件：[Navigation.php#L875](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L875) 和 [Navigation.php#L824](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L824)
+**准确行号与代码**：
+
+`updateEndDate()` 方法（第 821-863 行）：
+- 第 **824 行**：定义 `$functionMap` 数组，包含季度映射
+- 第 **827-829 行**：检查 `$range` 是否在映射中，存在则调用对应方法
+
+文件：[Navigation.php#L821-L834](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L821-L834)
 
 ```php
-// updateStartDate
-$functionMap = [
-    '3M' => 'firstOfQuarter',  // Carbon 原生方法：自然季度开始
-];
+// 第 821 行：方法签名
+public function updateEndDate(string $range, Carbon $start): Carbon
+{
+    // 第 824 行：季度映射在这里！
+    $functionMap = ['1D' => 'endOfDay', '1W' => 'endOfWeek', '1M' => 'endOfMonth', 
+                    '3M' => 'lastOfQuarter', 'custom' => 'startOfMonth'];
+    $end         = clone $start;
 
-// updateEndDate
-$functionMap = [
-    '3M' => 'lastOfQuarter',   // Carbon 原生方法：自然季度结束
-];
+    // 第 827-829 行：调用映射的方法
+    if (array_key_exists($range, $functionMap)) {
+        $function = $functionMap[$range];
+        $end->{$function}();  // '3M' 会调用 $end->lastOfQuarter()
+        return $end;
+    }
+    // ... 后续处理 6M、1Y 等
+}
 ```
 
-**关键注意**：这些方法都是 Carbon 原生的自然季度计算，与财年设置完全无关。
+`updateStartDate()` 方法（第 868-933 行）：
+- 第 **871-877 行**：定义 `$functionMap` 数组，包含季度映射
+- 第 **875 行**：季度映射具体位置 `'3M' => 'firstOfQuarter'`
+- 第 **878-884 行**：检查并调用对应方法
+
+文件：[Navigation.php#L868-L884](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L868-L884)
+
+```php
+// 第 868 行：方法签名
+public function updateStartDate(string $range, Carbon $start): Carbon
+{
+    // 第 871-877 行：季度映射在这里！
+    $functionMap = [
+        '1D'     => 'startOfDay',
+        '1W'     => 'startOfWeek',
+        '1M'     => 'startOfMonth',
+        // 第 875 行：季度映射具体位置
+        '3M'     => 'firstOfQuarter',
+        'custom' => 'startOfMonth',
+    ];
+    // 第 878-884 行：调用映射的方法
+    if (array_key_exists($range, $functionMap)) {
+        $function = $functionMap[$range];
+        $start->{$function}();  // '3M' 会调用 $start->firstOfQuarter()
+        return $start;
+    }
+    // ... 后续处理 6M、1Y 等
+}
+```
+
+**Carbon 原生方法说明**：
+- `firstOfQuarter()`：将日期修改为所在自然季度的第一天（1月/4月/7月/10月的1日）
+- `lastOfQuarter()`：将日期修改为所在自然季度的最后一天（3月/6月/9月/12月的最后一天）
+
+**关键注意**：这些方法都是 Carbon 原生的自然季度计算，**与财年设置完全无关**。即使财年从7月1日开始，`viewRange='3M'` 仍然会使用 1-3月、4-6月等自然季度划分。
 
 #### 10.2.5 ReportHelper 与季度的关系总结
 
@@ -1489,3 +1536,175 @@ session()->forget('range');
 ```
 
 这确保用户修改财年设置后，下次请求会重新计算日期范围。
+
+---
+
+### 10.4 ReportHelper 月份分组键导致的自然年与财年链接错位
+
+#### 10.4.1 分组键的定义
+
+文件：[ReportHelper.php#L113-L121](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Report/ReportHelper.php#L113-L121)
+
+```php
+while ($start <= $end) {
+    $year = $fiscalHelper->endOfFiscalYear($start)->year; // 财年结束年份作为分组键
+    if (!array_key_exists($year, $months)) {
+        $months[$year] = [
+            'fiscal_start' => $fiscalHelper->startOfFiscalYear($start)->format('Y-m-d'),
+            'fiscal_end'   => $fiscalHelper->endOfFiscalYear($start)->format('Y-m-d'),
+            'start'        => Carbon::createFromDate($year, 1, 1)->format('Y-m-d'),   // 自然年开始
+            'end'          => Carbon::createFromDate($year, 12, 31)->format('Y-m-d'), // 自然年结束
+            'months'       => [],
+        ];
+    }
+    // ... 添加月份到 $months[$year]['months']
+}
+```
+
+**关键点**：
+- 数组键 `$year` = `endOfFiscalYear($start)->year`（财年结束年份）
+- `fiscal_start` / `fiscal_end` = 真正的财年起止日期
+- `start` / `end` = 该年份的**自然年**起止（1月1日到12月31日）
+- `months` 数组 = 按财年分组的月份列表
+
+#### 10.4.2 错位现象分析（财年起点 = 07-01）
+
+假设财年从 7月1日开始，遍历日期从 2024年1月到 2025年6月：
+
+| 遍历月份 | 财年结束年份（分组键） | 该分组下累计的月份 |
+|----------|----------------------|-------------------|
+| 2024-01 | 2024（endOfFiscalYear = 2024-06-30） | 2024-01 |
+| 2024-02 | 2024 | 2024-01, 2024-02 |
+| ... | ... | ... |
+| 2024-06 | 2024 | 2024-01 ~ 2024-06（共6个月） |
+| 2024-07 | 2025（endOfFiscalYear = 2025-06-30） | 2024-07 |
+| 2024-08 | 2025 | 2024-07, 2024-08 |
+| ... | ... | ... |
+| 2024-12 | 2025 | 2024-07 ~ 2024-12（共6个月） |
+| 2025-01 | 2025 | 2024-07 ~ 2025-01（共7个月） |
+| ... | ... | ... |
+| 2025-06 | 2025 | 2024-07 ~ 2025-06（共12个月） |
+
+**错位表现**（以 "2025" 分组为例）：
+
+| 项目 | 实际值 | 标签/期望 | 错位程度 |
+|------|--------|-----------|----------|
+| 分组标签 | "2025" | 自然年2025 | 标签一致 |
+| 财年链接范围 | 2024-07-01 至 2025-06-30 | "2025 (fiscal year)" | 符合财年命名惯例（以结束年命名） |
+| 自然年链接范围 | 2025-01-01 至 2025-12-31 | "2025" | 标签一致，但与月份列表不匹配 |
+| 月份列表 | 2024-07 ~ 2025-06（12个月） | 2025年全年的月份 | **严重错位** |
+
+#### 10.4.3 视图层的呈现错位
+
+文件：[reports/index.twig#L70-L91](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/resources/views/reports/index.twig#L70-L91)
+
+```twig
+{% for year, data in months %}
+    {# 自然年链接 #}
+    <a href="#" data-start="{{ data.start }}" data-end="{{ data.end }}">{{ year }}</a>
+    
+    {# 财年链接（如果启用） #}
+    {% if customFiscalYear == 1 %}
+        <a href="#" data-start="{{ data.fiscal_start }}" data-end="{{ data.fiscal_end }}">
+            {{ year }} (fiscal year)
+        </a>
+    {% endif %}
+    
+    {# 季度链接（仅非自定义财年时显示） #}
+    {% if customFiscalYear == 0 %}
+        (Q1, Q2, Q3, Q4)
+    {% endif %}
+    
+    {# 月份列表 #}
+    <ul class="list-inline">
+        {% for month in data.months %}
+            <li><a data-start="{{ month.start }}" data-end="{{ month.end }}">{{ month.formatted }}</a></li>
+        {% endfor %}
+    </ul>
+{% endfor %}
+```
+
+**用户视角的错位感受**（财年起点 = 07-01，启用自定义财年）：
+
+用户看到的 "2025" 分组下：
+```
+2025           ← 点击跳转到 2025-01-01 至 2025-12-31（自然年）
+2025 (fiscal year)  ← 点击跳转到 2024-07-01 至 2025-06-30（财年）
+· 7月 · 8月 · 9月 · 10月 · 11月 · 12月   ← 这些是 2024 年的月份！
+· 1月 · 2月 · 3月 · 4月 · 5月 · 6月      ← 这些是 2025 年的月份
+```
+
+**错位问题清单**：
+
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | "2025" 标题下显示 2024 年 7-12 月的月份 | 用户困惑，以为自己看错了年份 |
+| 2 | 自然年链接（2025全年）与下方月份列表（2024-07~2025-06）不匹配 | 点击年份链接看到的范围和下方展示的月份不一致 |
+| 3 | 财年链接与月份列表匹配，但标签只有年份没有"财年"强调 | 用户可能混淆两个链接的含义 |
+| 4 | 月份按时间顺序排列，7月在前1月在后，不符合日历直觉 | 用户需要适应"从财年开始月到结束月"的排列 |
+
+#### 10.4.4 季度链接的隐含错位（非自定义财年时）
+
+当 `customFiscalYear == 0` 时，季度链接使用 `{{ year }}-01-01` 等硬编码格式：
+
+文件：[reports/index.twig#L78-L81](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/resources/views/reports/index.twig#L78-L81)
+
+```twig
+<a href="#" data-start="{{ year }}-01-01" data-end="{{ year }}-03-31">Q1</a>
+<a href="#" data-start="{{ year }}-04-01" data-end="{{ year }}-06-30">Q2</a>
+...
+```
+
+在非自定义财年模式下（`viewRange` 为自然年），分组键 `$year` 仍然是财年结束年份。但因为财年就是自然年（01-01到12-31），所以：
+- 分组键 = 自然年份
+- 月份列表 = 1月到12月
+- 季度链接 = 该年的自然季度
+
+**这种情况下是完全对齐的，没有错位。**
+
+但如果用户虽然启用了自定义财年（比如 07-01），但页面上仍然显示自然季度（实际不会，因为 `customFiscalYear == 1` 时季度链接被隐藏了），就会有严重错位。
+
+**这也是为什么自定义财年模式下要隐藏季度链接的另一个原因**：季度链接是按自然年硬编码的，与按财年分组的月份列表不匹配。
+
+#### 10.4.5 设计选择的权衡
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **当前方案（财年结束年为键）** | 财年链接与月份列表完全匹配 | 自然年链接与月份列表错位，用户困惑 |
+| 自然年为键 | 自然年链接与月份匹配 | 财年链接被拆分到两个年份分组，不直观 |
+| 两种分组并行展示 | 最清晰 | UI复杂，信息重复 |
+| 月份按日历顺序排列 | 符合用户直觉 | 财年概念被弱化 |
+
+**当前设计的核心理由**：
+1. **财年优先**：Firefly III 的报表设计以财年为核心组织单位，月份按财年分组是合理的
+2. **标签简洁**：用财年结束年份作为标签，符合会计惯例（FY2025 表示 2024-07 至 2025-06）
+3. **财年链接准确**：财年链接与下方月份列表完全一致，点击财年链接看到的就是下方展示的那些月份
+4. **自然年链接作为补充**：自然年链接只是额外提供的快捷入口，与月份列表不完全匹配是可以接受的
+
+#### 10.4.6 代码层面的因果链
+
+```
+ReportHelper::listOfMonths() [L102-L139]
+    ↓
+$year = endOfFiscalYear($start)->year  [L113]
+    ↓  （决定了分组键 = 财年结束年份）
+    ↓
+$fiscal_start / $fiscal_end = 财年实际起止  [L116-L117]
+    ↓  （与分组键的财年概念一致）
+    ↓
+$start / $end = Carbon::createFromDate($year, 1, 1) ...  [L118-L119]
+    ↓  （用分组键年份直接生成自然年起止，不考虑财年偏移）
+    ↓
+$months[] = 当月数据  [L126-L132]
+    ↓  （月份归属由财年决定，与分组键年份不完全重叠）
+    ↓
+视图 reports/index.twig
+    ├─ year 变量 = 分组键（财年结束年）
+    ├─ 自然年链接 → data.start / data.end（自然年）
+    ├─ 财年链接 → data.fiscal_start / fiscal_end（财年）
+    └─ 月份列表 → data.months（按财年分组）
+        → 自然年链接与月份列表错位
+        → 财年链接与月份列表一致
+```
+
+**错位的直接原因**：`start` / `end`（自然年）直接从分组键 `$year` 生成，没有考虑财年开始月份的偏移，而 `months` 数组是按财年分组的。两者基于不同的时间基准。
