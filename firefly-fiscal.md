@@ -624,7 +624,374 @@ public function endOfFiscalYear(Carbon $date): Carbon
 
 ---
 
-## 八、关键代码位置速查
+## 八、深入专题分析
+
+### 8.1 自定义财年季度隐藏的根本原因
+
+#### 8.1.1 现象描述
+在报表页面 [reports/index.twig](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/resources/views/reports/index.twig#L77-L82) 中，当 `customFiscalYear == 1` 时，季度链接（Q1-Q4）会被隐藏。
+
+```twig
+{% if customFiscalYear == 0 %}
+    (Q1, Q2, Q3, Q4 链接)
+{% endif %}
+```
+
+#### 8.1.2 技术层面的原因
+
+**原因一：季度的定义锚定自然年**
+
+系统中所有季度相关计算都是基于自然年的：
+
+| 组件 | 实现 | 文件/位置 |
+|------|------|-----------|
+| QTD 开始日期 | `firstOfQuarter()` (Carbon 原生方法，自然季度) | [Navigation.php#L293](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L293) |
+| 季度加法 | `addQuarters()` (Carbon 原生方法，按自然季度) | [Navigation.php#L214](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L214) |
+| 日期差计算 | `diffInMonths() / 3` (按自然月推算) | [Navigation.php#L148-L164](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L148-L164) |
+| 周期枚举 | `Periodicity::Quarterly` | [Navigation.php#L61-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Navigation.php#L61-L63) |
+
+**原因二：财年季度没有统一标准**
+
+不同国家/行业对"财年季度"的划分存在差异：
+- 有的按财年均分4个等长季度（每季度3个月，但起始月偏移）
+- 有的按实际月份对齐（Q1 是财年头3个月）
+- 有的公司按周数划分（13周为一季度）
+
+Firefly III 选择不预设任何一种定义，避免误导用户。
+
+**原因三：ReportHelper 月份分组逻辑的限制**
+
+[ReportHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Report/ReportHelper.php#L102-L139) 中的 `listOfMonths()` 方法按财年对月份分组，但只生成了年度级别的 `fiscal_start` / `fiscal_end`，没有季度级别的数据。如果要支持财年季度，需要在该方法中增加财年季度的计算逻辑。
+
+#### 8.1.3 设计选择的权衡
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **隐藏季度链接（当前方案）** | 不会产生歧义，实现简单 | 用户无法快速选择季度范围 |
+| 显示自然季度 | 实现简单，用户熟悉 | 与财年语境矛盾，容易混淆 |
+| 显示财年季度 | 与财年概念一致 | 需要额外配置，增加复杂度 |
+| 两者都显示 | 最灵活 | UI 拥挤，用户困惑 |
+
+Firefly III 选择了最简单且不会出错的方案：直接隐藏。
+
+---
+
+### 8.2 闰日财年起点的跨年回退机制
+
+#### 8.2.1 问题场景
+如果用户将财年开始日期设置为 `02-29`（2月29日，闰日），在非闰年时会发生什么？
+
+#### 8.2.2 代码分析
+
+财年开始日期的设置代码在 [FiscalHelper.php#L82-L83](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Fiscal/FiscalHelper.php#L82-L83)：
+
+```php
+[$mth, $day]  = explode('-', $prefStartStr);
+$startDate->day((int) $day)->month((int) $mth);
+```
+
+**Carbon 的日期溢出行为**：
+
+当设置的日期在目标月份不存在时，Carbon 会自动"溢出"到下个月。例如：
+- 输入年份 2023（平年），设置 day=29, month=2
+- 2023年2月只有28天，29日不存在
+- Carbon 会自动推进到 2023-03-01
+
+#### 8.2.3 跨年判定的连锁影响
+
+跨年判断在 [FiscalHelper.php#L86-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Fiscal/FiscalHelper.php#L86-L88)：
+
+```php
+if ($startDate > $date) {
+    $startDate->subYear();
+}
+```
+
+**平年中闰日财年起点的行为推演**（配置为 `02-29`）：
+
+| 输入日期 | 计算过程 | 溢出后日期 | 比较结果 | 最终结果 |
+|----------|----------|------------|----------|----------|
+| 2023-02-15 | 设置 day=29, month=2 → 溢出 | 2023-03-01 | 03-01 > 02-15 → 是 | 2022-03-01 |
+| 2023-03-01 | 设置 day=29, month=2 → 溢出 | 2023-03-01 | 03-01 = 03-01 → 否 | 2023-03-01 |
+| 2024-02-15 (闰年) | 设置 day=29, month=2 | 2024-02-29 | 02-29 > 02-15 → 是 | 2023-02-29 |
+| 2024-03-01 (闰年) | 设置 day=29, month=2 | 2024-02-29 | 02-29 < 03-01 → 否 | 2024-02-29 |
+
+**关键发现**：
+- 在平年，闰日财年起点会"漂移"到3月1日
+- 漂移导致2月15日的输入会回退到上一年的3月1日，而不是2月29日
+- 闰年和平年的财年开始日期不一致，每年会有1天的偏移
+
+#### 8.2.4 endOfFiscalYear 的连锁影响
+
+`endOfFiscalYear()` 在 [FiscalHelper.php#L49-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Fiscal/FiscalHelper.php#L49-L63) 中通过 `startOfFiscalYear + 1年 - 1天` 计算。
+
+平年时，如果 `startOfFiscalYear` 是 2023-03-01（溢出结果），那么：
+- endDate = 2023-03-01 + 1年 = 2024-03-01
+- endDate = 2024-03-01 - 1天 = 2024-02-29
+
+这正好是闰年的2月29日，形成了一种"偶然的正确"。
+
+#### 8.2.5 设计选择分析
+
+Firefly III 没有对闰日财年起点做特殊处理，原因可能是：
+1. **使用场景极少**：实际中几乎没有企业将财年开始设在2月29日
+2. **Carbon 行为可预测**：溢出行为虽然反直觉，但结果一致
+3. **避免过度设计**：为极端边缘情况增加复杂逻辑性价比低
+
+**潜在风险**：
+- 平年和闰年的财年起止日期不一致
+- 财年长度可能不是精确的365/366天
+- 用户可能意外设置闰日而不自知
+
+---
+
+### 8.3 时区配置与跨年判定的关联
+
+#### 8.3.1 时区配置的读取点
+
+系统时区配置在 [config/app.php#L43](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/config/app.php#L43)：
+
+```php
+'timezone' => env_default_when_empty(env('TZ'), 'UTC'),
+```
+
+默认值为 `UTC`，可通过环境变量 `TZ` 修改。
+
+#### 8.3.2 时区使用的不一致性
+
+**使用配置时区的地方**：
+
+| 位置 | 代码 | 说明 |
+|------|------|------|
+| 魔术词计算 | `today(config('app.timezone'))` | [Date.php#L48-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L48-L61) |
+| 会话初始化 | `today(config('app.timezone'))` | [Range.php#L133](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Middleware/Range.php#L133) |
+| 配置保存 | `Carbon::parse(..., config('app.timezone'))` | [PreferencesController.php#L301](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/PreferencesController.php#L301) |
+| 报表首页 | `today(config('app.timezone'))` | [ReportController.php#L223](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/ReportController.php#L223) |
+
+**未显式指定时区的地方**：
+
+| 位置 | 代码 | 说明 |
+|------|------|------|
+| 路由日期解析 | `new Carbon($value)` | [Date.php#L71](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L71) |
+| 财年日期设置 | `$startDate->day()->month()` | [FiscalHelper.php#L83](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Fiscal/FiscalHelper.php#L83) |
+
+#### 8.3.3 跨年判定与时区的关系
+
+跨年判断的核心在 [FiscalHelper.php#L86](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Helpers/Fiscal/FiscalHelper.php#L86)：
+
+```php
+if ($startDate > $date) {
+```
+
+这个比较是基于**日期时间对象**的完整比较（包括时间部分）。
+
+**时区影响分析**：
+
+假设：
+- 应用时区：`Asia/Shanghai` (UTC+8)
+- 当前时间：2024-01-01 01:00:00 (北京时间)
+- 财年开始：`01-01`
+- PHP 默认时区：`UTC`
+
+| 场景 | 日期值（含时间） | 比较结果 |
+|------|------------------|----------|
+| `today(config('app.timezone'))` → startOfFiscalYear | 2024-01-01 00:00:00 (Asia/Shanghai) = 2023-12-31 16:00:00 UTC | 起点正确 |
+| `new Carbon('2024-01-01')` (默认 UTC) | 2024-01-01 00:00:00 UTC = 2024-01-01 08:00:00 Asia/Shanghai | 日期相同但时区不同 |
+
+**关键问题**：
+- Carbon 的日期比较会考虑时区
+- 如果 `$date` 和 `$startDate` 时区不同，即使"同一天"也可能比较出意外结果
+- 跨年边界（12月31日 vs 1月1日）附近的日期，时区差异可能导致回退判断错误
+
+#### 8.3.4 实际影响评估
+
+**影响有限的原因**：
+
+1. **PHP 默认时区通常与应用一致**：Laravel 会在启动时设置默认时区
+2. **日期比较通常在同一天内**：财年开始日期通常与输入日期年份相同
+3. **跨年判断是日期级别的**：虽然使用 `>` 比较，但通常涉及整日的差异
+
+**边界情况（可能出错）**：
+
+当输入日期正好是财年开始日期的午夜附近，且两个日期对象时区不同时：
+- 输入日期：2024-07-01 00:30:00 (Asia/Shanghai)
+- 计算的开始日期：2024-07-01 00:00:00 (UTC) = 2024-07-01 08:00:00 (Asia/Shanghai)
+- 比较：输入日期 < 开始日期？→ 如果不转换时区，可能得到错误结果
+
+#### 8.3.5 设计选择分析
+
+Firefly III 在关键路径（魔术词、会话初始化）上显式使用 `config('app.timezone')`，但在某些地方依赖 PHP 默认时区。这种不一致性是常见的技术债务：
+
+- **优点**：代码简洁，大部分场景下工作正常
+- **缺点**：边界情况下可能出现难以调试的时区问题
+
+---
+
+### 8.4 魔术词路由后的完整消费链路
+
+#### 8.4.1 链路总览
+
+```
+URL: /reports/default/1,2,3/currentFiscalYearStart/currentFiscalYearEnd
+    ↓
+路由匹配: reports.report.default
+    ↓
+Binder 中间件遍历路由参数
+    ├─ accountList → AccountList::routeBinder()
+    ├─ start_date  → Date::routeBinder('currentFiscalYearStart')
+    │   └─ 命中魔术词 → FiscalHelper::startOfFiscalYear(today()) → Carbon 对象
+    └─ end_date    → Date::routeBinder('currentFiscalYearEnd')
+        └─ 命中魔术词 → FiscalHelper::endOfFiscalYear(today()) → Carbon 对象
+    ↓
+控制器方法参数注入: defaultReport(Collection $accounts, Carbon $start, Carbon $end)
+    ↓
+ReportGeneratorFactory::reportGenerator('Standard', $start, $end)
+    ├─ 计算日期差: $start->diffInMonths($end, true)
+    ├─ > 12个月 → MultiYearReportGenerator
+    ├─ > 1个月  → YearReportGenerator
+    └─ ≤ 1个月  → MonthReportGenerator
+    ↓
+生成器渲染视图 → 返回 HTML
+```
+
+#### 8.4.2 路由绑定配置
+
+路由参数名与绑定类的映射在 [config/bindables.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/config/bindables.php#L100-L103)：
+
+```php
+'start_date' => Date::class,
+'end_date'   => Date::class,
+'date'       => Date::class,
+```
+
+路由定义在 [routes/web.php#L929](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/routes/web.php#L929)：
+
+```php
+Route::get('default/{accountList}/{start_date}/{end_date}', [
+    'uses' => 'ReportController@defaultReport', 
+    'as' => 'report.default'
+]);
+```
+
+#### 8.4.3 Binder 中间件工作流程
+
+[Binder.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Middleware/Binder.php) 的处理流程：
+
+```php
+foreach ($request->route()->parameters() as $key => $value) {
+    if (array_key_exists($key, $this->binders)) {
+        $boundObject = $this->performBinding($key, $value, $request->route());
+        $request->route()->setParameter($key, $boundObject);
+    }
+}
+```
+
+**关键点**：
+- 遍历所有路由参数
+- 检查参数名是否在 `bindables` 配置中
+- 调用对应类的 `routeBinder()` 静态方法
+- 将结果替换回路由参数中
+
+#### 8.4.4 Date 绑定器的魔术词解析
+
+[Date.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Support/Binder/Date.php#L42-L80) 的处理逻辑：
+
+```
+输入 value → 检查是否为魔术词
+    ├─ 是 → 返回预计算的 Carbon 对象
+    └─ 否 → new Carbon($value) 解析日期字符串
+            ├─ 成功 → 返回 Carbon 对象
+            └─ 失败 → 抛出 NotFoundHttpException
+```
+
+**全部魔术词清单**：
+
+| 魔术词 | 含义 | 计算方式 |
+|--------|------|----------|
+| `currentMonthStart` | 本月初 | `today()->startOfMonth()` |
+| `currentMonthEnd` | 本月末 | `today()->endOfMonth()` |
+| `currentYearStart` | 本年初 | `today()->startOfYear()` |
+| `currentYearEnd` | 本年末 | `today()->endOfYear()` |
+| `previousMonthStart` | 上月初 | 本月初-1天→月初 |
+| `previousMonthEnd` | 上月末 | 本月初-1天→月末 |
+| `previousYearStart` | 上年初 | 本年初-1天→年初 |
+| `previousYearEnd` | 上年末 | 本年初-1天→年末 |
+| `currentFiscalYearStart` | 本财年初 | `FiscalHelper::startOfFiscalYear(today())` |
+| `currentFiscalYearEnd` | 本财年末 | `FiscalHelper::endOfFiscalYear(today())` |
+| `previousFiscalYearStart` | 上财年初 | 本财年初 `->subYear()` |
+| `previousFiscalYearEnd` | 上财年末 | 本财年末 `->subYear()` |
+
+**注意**：`previousFiscalYearStart` 是直接对 `startOfFiscalYear(today())` 调用 `subYear()`，而不是调用 `startOfFiscalYear(today()->subYear())`。对于非闰日财年起点，两者结果相同；但对于闰日起点，可能有细微差异。
+
+#### 8.4.5 控制器层消费
+
+报表控制器在 [ReportController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Http/Controllers/ReportController.php) 中直接接收 Carbon 对象：
+
+```php
+public function defaultReport(Collection $accounts, Carbon $start, Carbon $end)
+{
+    if ($end < $start) {
+        return view('errors.error')->with(...);
+    }
+    
+    $generator = ReportGeneratorFactory::reportGenerator('Standard', $start, $end);
+    $generator->setAccounts($accounts);
+    
+    return $generator->generate();
+}
+```
+
+**关键点**：
+- 参数类型声明为 `Carbon`，由 Laravel 服务容器自动注入
+- 控制器不关心日期是魔术词解析的还是字符串解析的
+- 只做基本的起止日期校验（结束日期不能早于开始日期）
+
+#### 8.4.6 报表生成器工厂的周期判定
+
+[ReportGeneratorFactory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Generator/Report/ReportGeneratorFactory.php#L39-L63) 根据日期跨度选择生成器：
+
+```php
+$period = 'Month';
+if ($start->diffInMonths($end, true) > 1) {
+    $period = 'Year';
+}
+if ($start->diffInMonths($end, true) > 12) {
+    $period = 'MultiYear';
+}
+```
+
+**财年日期跨度的结果**：
+- 财年跨度为 12 个月左右（精确为 365/366 天）
+- `diffInMonths` 结果接近 12
+- `> 1` → 触发 Year 报告
+- `> 12` → 不触发（因为正好约12个月）
+- 最终选择 **YearReportGenerator**
+
+#### 8.4.7 视图层消费
+
+[YearReportGenerator.php](file:///d:/fz/0601-1/solo-dogfeeding/code/98-firefly-iii/app/Generator/Report/Standard/YearReportGenerator.php#L59-L64) 将日期传递给视图：
+
+```php
+$result = view('reports.default.year', [
+    'accountIds' => $accountIds,
+    'reportType' => $reportType,
+    'start'      => $this->start,
+    'end'        => $this->end,
+])->render();
+```
+
+视图再使用这些日期进行数据查询和图表渲染。
+
+#### 8.4.8 设计亮点
+
+1. **透明性**：控制器和下游代码完全不需要知道日期来自魔术词还是硬编码
+2. **可扩展性**：新增魔术词只需在 `Date::routeBinder()` 中添加条目
+3. **一致性**：所有日期入口都经过同一绑定器，行为统一
+4. **SEO 友好**：魔术词 URL 具有可读性和可分享性
+
+---
+
+## 九、关键代码位置速查
 
 | 功能 | 文件 | 关键行 |
 |------|------|--------|
