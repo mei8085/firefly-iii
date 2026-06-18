@@ -318,14 +318,43 @@ Web 表单中 bill_id 是顶级字段（因为 Web 表单每个 Recurrence 只�
 ]],
 ```
 
-验证规则：
+验证规则（完整代码分析）：
+
+[RecurrenceFormRequest::rules()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php#L155-L236) L188：
 
 ```php
-// L188: bill_id 必须存在于 bills 表且属于当前用户
+// Web 端 bill_id 有完整的请求级校验：
+// 1. mustExist:bills,id — 该 ID 必须在 bills 表中存在
+// 2. belongsToUser:bills,id — 该 ID 必须属于当前用户
+// 3. nullable — 可以为空（不关联账单）
 'bill_id' => ['mustExist:bills,id', 'belongsToUser:bills,id', 'nullable'],
 ```
 
 #### 3.5.2 API 请求 — StoreRequest / UpdateRequest
+
+**请求验证规则对比（重要差异）**：
+
+[StoreRequest::rules()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/StoreRequest.php#L78-L116)
+[UpdateRequest::rules()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/UpdateRequest.php#L85-L125)
+
+**关键发现：API 端的 rules() 数组中没有 bill_id 的显式校验规则**！
+
+对比其他关联字段的校验规则（API 端 rules() 中有列出来）：
+
+| 关联字段 | Web 端有校验？ | API 端有校验？ | API 端校验规则 |
+|----------|--------------|--------------|--------------|
+| `transactions.*.budget_id` | ✅ | ✅ | `nullable, mustExist:budgets,id, BelongsUser` |
+| `transactions.*.category_id` | ✅ | ✅ | `nullable, mustExist:categories,id, BelongsUser` |
+| `transactions.*.piggy_bank_id` | ✅ | ✅ | `nullable, numeric, mustExist:piggy_banks,id, BelongsUser` |
+| `transactions.*.source_id` | ✅ | ✅ | `numeric, nullable, BelongsUser` |
+| `transactions.*.destination_id` | ✅ | ✅ | `numeric, nullable, BelongsUser` |
+| **`transactions.*.bill_id`** | ✅ | **❌ 缺失** | **未在 rules() 中列出** |
+
+这意味着：
+1. **Web 端**：bill_id 在请求进入控制器前就完成了校验（必须存在且属于当前用户），若校验失败直接返回 422
+2. **API 端**：bill_id 没有请求级校验，任何数字（哪怕不存在或属于其他用户）都能通过 Request 层，但会在**保存层的 setBill() 中被二次校验**（见 3.7 节详细分析）
+
+API 的数据提取流程：
 
 [StoreRequest::getAll()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/StoreRequest.php#L57-L73)
 [UpdateRequest::getAll()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/UpdateRequest.php#L58-L80)
@@ -348,21 +377,28 @@ protected function getSingleTransactionData(array $transaction): array
 {
     $return     = [];
     $stringKeys = ['id'];
-    // L36: bill_id 在 intKeys 数组中，会被转为 int
-    $intKeys    = ['currency_id', 'foreign_currency_id', 'source_id', 
-                   'destination_id', 'bill_id', 'piggy_bank_id', 
+    // L36: bill_id 在 intKeys 数组中，会被强转为 int
+    // 注意：bill_id 在数组中出现了两次（重复，不影响功能但说明是代码笔误）
+    $intKeys    = ['currency_id', 'foreign_currency_id', 'source_id',
+                   'destination_id', 'bill_id', 'piggy_bank_id',
                    'bill_id', 'budget_id', 'category_id'];
     $keys       = ['amount', 'currency_code', 'foreign_amount', ...];
 
     foreach ($intKeys as $key) {
         if (array_key_exists($key, $transaction)) {
-            $return[$key] = (int) $transaction[$key];
+            $return[$key] = (int) $transaction[$key];  // 强转为 int，空字符串会变 0
         }
     }
     // ...
     return $return;
 }
 ```
+
+数据提取的关键细节：
+- `bill_id` 列在 `$intKeys` 中，会被 `(int)` 强转
+- 如果请求传 `bill_id: ""`（空字符串）→ 转成 `0`
+- 如果请求传 `bill_id: null` → 因为 `array_key_exists` 判断键存在，会被转成 `0`
+- 如果请求中 **没有传 `bill_id` 这个键** → 不进入 `$return`，下游 `array_key_exists('bill_id', $array)` 为 false，不调用 setBill()
 
 API 请求体示例：
 
@@ -380,6 +416,15 @@ API 请求体示例：
     }]
 }
 ```
+
+#### 3.5.3 请求验证规则覆盖情况汇总
+
+| 校验维度 | Web 端（RecurrenceFormRequest） | API 端（StoreRequest / UpdateRequest） |
+|----------|------------------------------|-------------------------------------|
+| bill_id 请求级校验 | ✅ `mustExist:bills,id` + `belongsToUser:bills,id` | ❌ **缺失** |
+| 校验失败返回 | 422 表单错误，直接中止 | 不中止，进入保存层后由 setBill() 二次校验 |
+| 无效 bill_id 的影响 | 请求被拒，不进入保存流程 | setBill() 找不到 → 静默删除 bill_id 关联（不报错） |
+| 跨用户 bill_id（传别人的） | 请求被拒（belongsToUser） | setBill() 按当前用户查找 → 找不到 → 静默删除关联 |
 
 ### 3.6 统一保存层 — RecurringRepository
 
@@ -438,18 +483,22 @@ if (array_key_exists('bill_id', $array)) {
 ```php
 private function setBill(RecurrenceTransaction $transaction, int $billId): void
 {
+    // 步骤 1: 实例化 BillFactory，并按「循环交易所属用户」设置用户上下文
     $billFactory = app(BillFactory::class);
-    $billFactory->setUser($transaction->recurrence->user);
-    $bill = $billFactory->find($billId, null);  // 校验 billId 有效性
-
+    $billFactory->setUser($transaction->recurrence->user);  // 关键：用当前 Recurrence 的用户
+    
+    // 步骤 2: 按当前用户查找 bill（BillFactory::find() 会过滤用户）
+    $bill = $billFactory->find($billId, null);
+    
+    // 步骤 3: 找不到 bill（无效 ID / 属于其他用户 / ID=0）→ 静默移除关联
     if (null === $bill) {
-        // bill 不存在，删除之前的关联（如果有）
+        // 删除 rt_meta 表中该交易模板的 bill_id 关联（如果有）
         $transaction->recurrenceTransactionMeta()
             ->where('name', 'bill_id')->delete();
-        return;
+        return;  // 不报错，静默返回
     }
 
-    // bill 有效，创建或更新 rt_meta 记录
+    // 步骤 4: 找到有效 bill → upsert rt_meta 记录
     $meta = $transaction->recurrenceTransactionMeta()
         ->where('name', 'bill_id')->first();
 
@@ -458,10 +507,61 @@ private function setBill(RecurrenceTransaction $transaction, int $billId): void
         $meta->rt_id = $transaction->id;
         $meta->name  = 'bill_id';
     }
-    $meta->value = $bill->id;  // 注意：存入的是 string 类型
+    $meta->value = $bill->id;  // 注意：存入的是 string 类型（rt_meta.value 是 varchar）
     $meta->save();
 }
 ```
+
+### 3.7.1 BillFactory::find() — 按当前用户查找账单的核心实现
+
+[BillFactory::find()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/BillFactory.php#L117-L134)
+
+```php
+public function find(?int $billId, ?string $billName): ?Bill
+{
+    $billId   = (int) $billId;
+    $billName = (string) $billName;
+    $bill     = null;
+    
+    // 先按 ID 查找，关键：通过 $this->user->bills() 关联！
+    // 这等价于 WHERE bills.id = ? AND bills.user_id = ?
+    // 也就是说跨用户的 billId 会自动被过滤掉，返回 null
+    if ($billId > 0) {
+        /** @var Bill $bill */
+        $bill = $this->user->bills()->find($billId);  // ← 自动带 user_id 过滤
+    }
+
+    // ID 找不到时，回退到按 name 模糊查找（setBill 调用时 billName=null，所以不会走这步）
+    if (null === $bill && '' !== $billName) {
+        return $this->findByName($billName);
+    }
+
+    return $bill;
+}
+```
+
+**关键理解**：`$this->user->bills()->find($billId)` 不是 `Bill::find($billId)`，而是通过 User 的 HasMany 关联查询。Eloquent 会自动加上 `WHERE user_id = 当前用户ID` 条件。这保证了：
+- 传了不存在的 ID → 查不到 → 返回 null
+- 传了属于其他用户的 ID → 被 user_id 过滤 → 返回 null
+- 传了 ID=0 → `$billId > 0` 不成立 → 返回 null
+
+### 3.7.2 setBill() 各分支场景完整覆盖
+
+| $billId 传入值 | BillFactory::find() 行为 | 结果 | rt_meta 变化 |
+|----------------|------------------------|------|-------------|
+| 有效 ID（属于当前用户） | `$this->user->bills()->find(5)` → 查到 Bill 对象 | ✅ 成功关联 | 新增或更新 `rt_meta(name='bill_id', value='5')` |
+| 无效 ID（不存在） | find() 返回 null | ❌ 找不到 → 静默移除 | 删除该 rt_id 的 `bill_id` 记录 |
+| 跨用户 ID（属于别人） | `WHERE user_id = 当前用户 AND id = 其他用户的id` → 返回 null | ❌ 找不到 → 静默移除 | 删除该 rt_id 的 `bill_id` 记录 |
+| `0`（API 传 null 或空字符串被强转） | `$billId > 0` 不成立 → 返回 null | ❌ 找不到 → 静默移除 | 删除该 rt_id 的 `bill_id` 记录 |
+| 负数 ID（极少见） | `(int)$billId` 后若 < 0 → `$billId > 0` 不成立 → 返回 null | ❌ 找不到 → 静默移除 | 删除该 rt_id 的 `bill_id` 记录 |
+| 传入 bill_id 但之前没关联过 | 找不到 Bill → DELETE 查询执行 0 行影响 | ❌ 无关联，不报错 | 无变化 |
+| 之前关联了 bill A，现在传 bill B（有效） | 查到 B → 更新 meta.value | ✅ 变更关联 | 更新 `rt_meta.value` 从 'A' 到 'B' |
+| 之前关联了 bill A，现在传无效值 | 找不到 → DELETE | ❌ 移除关联 | 删除该 rt_id 的 `bill_id` 记录 |
+
+**重要设计意图**：
+1. **双层校验机制**：Web 端 Request 层 + 保存层 setBill()（双保险），API 端只有保存层 setBill()（因为 Request 层校验缺失）
+2. **静默降级（Fail-Silent）**：无效 bill_id 不会抛出异常或报错，而是「静默移除关联」。这种设计避免了脏数据导致的保存失败，但可能让调用方（特别是 API 客户端）不知道自己传的 bill_id 其实无效
+3. **严格用户隔离**：通过 `$this->user->bills()` 关联查询，从机制上杜绝越权访问其他用户的账单
 
 ### 3.8 更新 Recurrence 时的 bill_id 处理
 
@@ -494,11 +594,15 @@ if (array_key_exists('bill_id', $submitted)) {
 | 更新控制器 | [Recurring\EditController](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/EditController.php) | [Models\Recurrence\UpdateController](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Controllers/Models/Recurrence/UpdateController.php) |
 | 请求类 | [RecurrenceFormRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php) | [StoreRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/StoreRequest.php) / [UpdateRequest](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Api/V1/Requests/Models/Recurrence/UpdateRequest.php) |
 | bill_id 位置 | 表单顶级字段 `bill_id` | 嵌套字段 `transactions[*].bill_id` |
+| **bill_id 请求级校验** | **✅ `mustExist:bills,id` + `belongsToUser:bills,id`** | **❌ 缺失（无请求级校验）** |
 | 数据提取 Trait | （RecurrenceFormRequest 自身实现） | [GetRecurrenceData](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/Request/GetRecurrenceData.php) |
 | 统一 Repository | **[RecurringRepository::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Recurring/RecurringRepository.php#L550-L557) / [update()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Recurring/RecurringRepository.php#L585-L591)** | 相同 |
 | 创建 Factory | [RecurrenceFactory](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/RecurrenceFactory.php) | 相同 |
 | 更新 Service | [RecurrenceUpdateService](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php) | 相同 |
-| bill_id 写入 Trait | **[RecurringTransactionTrait::setBill()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php#L275-L295)** | 相同 |
+| 按用户查找账单 | [BillFactory::find()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/BillFactory.php#L117-L134)（`$this->user->bills()->find()`） | 相同 |
+| bill_id 写入 Trait | **[RecurringTransactionTrait::setBill()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php#L275-L295)**（找不到即静默移除） | 相同 |
+| 跨用户 bill_id 拦截 | Request 级 `belongsToUser` + 保存层 `$user->bills()` 双重拦截 | 仅保存层 `$user->bills()` 拦截 |
+| 无效值处理策略 | Request 级返回 422 | 保存层静默删除关联 |
 
 ---
 
