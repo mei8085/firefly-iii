@@ -458,19 +458,13 @@ convertToPrimary 开启 且 主货币ID ≠ 交易货币ID？
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                        第四阶段：前端 Alpine.js 组件                                │
 │                                                                                   │
-│  [dashboard.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/dashboard.js)（主入口） │
+│  [dashboard.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/dashboard.js)（主入口，仅管理开关 UI） │
 │    init():                                                                        │
-│      Promise.all([                                                                │
-│        getVariable('convert_to_primary', false),   ← 用户偏好                     │
-│        getConfiguration('cer.enabled', false)       ← 系统配置                    │
-│      ]).then((values) => {                                                         │
-│        this.convertToPrimary = values[1] && values[3];  ← 前端也做双条件判断       │
-│      });                                                                           │
-│                                                                                   │
-│      getVariable(name, default):                                                   │
-│         ├─ window.store.get(name)  → 优先读本地 store                             │
-│         └─ 否则 GET /api/v1/preferences/{name}  → 走 API 读服务端                 │
-│              └─ Api\V1\Controllers\User\PreferencesController                     │
+│      getVariable('convert_to_primary', false).then(value => {                     │
+│        this.convertToPrimary = value;  ← 仅读用户偏好，不做双条件判断              │
+│      });                                                                          │
+│      // 注：dashboard.js 不读 cer.enabled，不判断双条件                             │
+│      //     其 convertToPrimary 只用于复选框绑定                                    │
 │                                                                                   │
 │    savePrimarySettings(event):                                                     │
 │      setVariable('convert_to_primary', target.checked)                             │
@@ -480,17 +474,31 @@ convertToPrimary 开启 且 主货币ID ≠ 交易货币ID？
 │              └─ 失败则 POST 创建新偏好（API 路径，不触发重算）                       │
 │                                                                                   │
 │    事件广播：$dispatch('convert-to-primary', target.checked)                       │
+│         │  ← 广播的是复选框原始值，非双条件计算结果                                 │
 │         │                                                                         │
-│         ├── [accounts.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/accounts.js) eventListeners │
-│         │    ├─ this.convertToPrimary = event.detail                               │
-│         │    ├─ this.accountList = []  ← 清空列表缓存                              │
-│         │    ├─ chartData = null      ← 清空图表缓存                               │
-│         │    └─ loadChart() + loadAccounts()  ← 重新拉取数据                       │
+│         ├── [accounts.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/accounts.js) │
+│         │    init():  ← 唯一做双条件判断的组件                                      │
+│         │      Promise.all([                                                       │
+│         │        getVariable('convert_to_primary', false),  // values[1]           │
+│         │        getConfiguration('cer.enabled', false)      // values[3]          │
+│         │      ]).then(values => {                                                 │
+│         │        this.convertToPrimary = values[1] && values[3];  ← 双条件判断     │
+│         │      });                                                                 │
+│         │    eventListeners['@convert-to-primary.window']:                        │
+│         │      this.convertToPrimary = event.detail  ← 直接取事件值（不经双条件） │
+│         │      this.accountList = []  ← 清空列表缓存                              │
+│         │      chartData = null       ← 清空图表缓存                              │
+│         │      loadChart() + loadAccounts()  ← 重新拉取数据                       │
 │         │                                                                         │
-│         └── [boxes.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/boxes.js) eventListeners │
-│              ├─ this.convertToPrimary = event.detail                               │
-│              ├─ this.boxData = null   ← 清空盒子缓存                               │
-│              └─ loadBoxes()            ← 重新拉取 Summary API                     │
+│         └── [boxes.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/boxes.js) │
+│              init():  ← 不做双条件判断                                             │
+│                getVariable('convert_to_primary', false).then(value => {            │
+│                  this.convertToPrimary = value;  ← 仅读用户偏好                   │
+│                });                                                                 │
+│              eventListeners['@convert-to-primary.window']:                        │
+│                this.convertToPrimary = event.detail                                │
+│                this.boxData = null   ← 清空盒子缓存                               │
+│                loadBoxes()            ← 重新拉取 Summary API                     │
 │                                                                                   │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
