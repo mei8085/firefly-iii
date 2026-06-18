@@ -9,7 +9,9 @@
 5. [汇率转换机制](#5-汇率转换机制)
 6. [账户余额计算流程](#6-账户余额计算流程)
 7. [报表数值计算](#7-报表数值计算)
-8. [完整交互流程图](#8-完整交互流程图)
+8. [convertToPrimary 开关完整传递链路](#8-converttoprimary-开关完整传递链路)
+9. [区间余额未折算场景深度分析](#9-区间余额未折算场景深度分析)
+10. [完整交互流程图](#10-完整交互流程图)
 
 ---
 
@@ -83,6 +85,25 @@ Firefly III 的货币系统围绕以下核心类展开协作：
 2. 系统配置 `enable_exchange_rates` = true（来自 FireflyConfig 或 `cer.enabled`）
 
 结果按用户ID缓存在 `PreferencesSingleton` 中。
+
+### 2.5 偏好的保存与触发重算
+
+保存逻辑在 [PreferencesController::postIndex()](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Http/Controllers/PreferencesController.php#L284-L295)：
+
+```
+用户提交 convertToPrimary=1
+  │
+  ├─ Preferences::set('convert_to_primary', true)
+  ├─ PreferencesSingleton::getInstance()->resetPreferences()  ← 清空单例缓存
+  └─ event(new UserGroupChangedPrimaryCurrency($user->userGroup))
+       │
+       └─ [RecalculatesPrimaryCurrencyAmounts](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Listeners/System/RecalculatesPrimaryCurrencyAmounts.php#L34-L45) 监听器
+            └─ Amount::convertToPrimary() === true ?
+                 ├─ 是 → PrimaryAmountRecalculationService::recalculate()  // 批量重算所有交易 native_amount
+                 └─ 否 → 仅输出日志 "Will NOT convert..."
+```
+
+> 注意：只有当开关从 false 切换到 true 时才会触发 `UserGroupChangedPrimaryCurrency` 事件（见 L286 的 if 判断）。
 
 ---
 
@@ -353,7 +374,235 @@ convertToPrimary 开启 且 主货币ID ≠ 交易货币ID？
 
 ---
 
-## 8. 完整交互流程图
+## 8. convertToPrimary 开关完整传递链路
+
+### 8.1 链路全景：偏好存储 → 后端注入 → API → 前端
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        第一阶段：偏好持久化                                        │
+│                                                                                   │
+│  用户在设置页面勾选"Convert to primary"复选框                                       │
+│         │                                                                         │
+│         ▼ POST /preferences                                                       │
+│  PreferencesController::postIndex()                                               │
+│         ├─ Preferences::set('convert_to_primary', $convertToPrimary)              │
+│         ├─ PreferencesSingleton::resetPreferences()  ← 清空单例缓存                │
+│         └─ event(UserGroupChangedPrimaryCurrency)                                 │
+│              └─ RecalculatesPrimaryCurrencyAmounts → 重算 native_amount            │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        第二阶段：后端 Controller 注入                              │
+│                                                                                   │
+│  所有 HTTP 请求经过基类 Controller::__construct()                                  │
+│  [Controller.php#L137-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Http/Controllers/Controller.php#L137-L173) │
+│         │                                                                         │
+│         ├─ $this->primaryCurrency  = Amount::getPrimaryCurrency();                │
+│         ├─ $this->convertToPrimary = Amount::convertToPrimary();                  │
+│         │     ├─ 用户偏好 convert_to_primary = true ?                              │
+│         │     └─ AND 系统配置 cer.enabled = true ?                                 │
+│         │                                                                         │
+│         ├─ View::share('convertToPrimary', $this->convertToPrimary)               │
+│         │     └─ 所有 Blade/Twig 视图可直接使用变量                                  │
+│         │                                                                         │
+│         └─ 所有继承 Controller 的子类自动获得 $this->convertToPrimary               │
+│              (包括 Json/*、Chart/*、Api/V1/* 等所有控制器)                          │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    │
+              ┌─────────────────────┴─────────────────────┐
+              ▼                                           ▼
+┌──────────────────────────────┐          ┌─────────────────────────────────────┐
+│    第三阶段 A：API JSON 数据   │          │    第三阶段 B：V2 前端 Blade 视图     │
+│                              │          │                                      │
+│  Api\V1\Controllers\         │          │  [v2/index.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/views/v2/index.blade.php) │
+│    Summary\BasicController   │          │    @include('partials.dashboard.*')  │
+│    Chart\AccountController   │          │                                      │
+│                              │          │  internalsModal 中复选框：             │
+│  - 后端侧直接使用             │          │    x-model="convertToPrimary"        │
+│    $this->convertToPrimary   │          │    @change="savePrimarySettings"     │
+│    控制返回字段结构            │          │                                      │
+│                              │          │  初始值由前端 JS 异步从 API 获取         │
+└──────────────────────────────┘          └──────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        第四阶段：前端 Alpine.js 组件                                │
+│                                                                                   │
+│  [dashboard.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/dashboard.js)（主入口） │
+│    init():                                                                        │
+│      getVariable('convert_to_primary', false)                                     │
+│         │                                                                         │
+│         ├─ window.store.get('convert_to_primary')  ← 优先读本地 store             │
+│         └─ 否则 GET /api/v1/preferences/{name}                                     │
+│              └─ Api\V1\Controllers\User\PreferencesController                     │
+│                                                                                   │
+│    savePrimarySettings(event):                                                     │
+│      setVariable('convert_to_primary', target.checked)                             │
+│         ├─ window.store.set(name, value)                                           │
+│         └─ PUT /api/v1/preferences/{name} → 写回服务器偏好                         │
+│              └─ 失败则 POST 创建新偏好                                              │
+│                                                                                   │
+│    事件广播：$dispatch('convert-to-primary', target.checked)                       │
+│         │                                                                         │
+│         ├── [accounts.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/accounts.js) eventListeners │
+│         │    ├─ this.convertToPrimary = event.detail                               │
+│         │    ├─ this.accountList = []  ← 清空缓存                                  │
+│         │    ├─ chartData = null      ← 清空图表缓存                               │
+│         │    └─ loadChart() + loadAccounts()  ← 重新拉取数据                       │
+│         │                                                                         │
+│         └── [boxes.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/boxes.js) eventListeners │
+│              ├─ this.convertToPrimary = event.detail                               │
+│              ├─ this.boxData = null   ← 清空盒子缓存                               │
+│              └─ loadBoxes()            ← 重新拉取 Summary API                     │
+│                                                                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 各 API 端点如何消费开关
+
+| API 端点 | 所在文件 | 消费方式 | 影响的字段 |
+|----------|----------|----------|------------|
+| `GET /api/v1/summary/basic` | [BasicController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Api/V1/Controllers/Summary/BasicController.php#L116-L314) | `Amount::convertToPrimary()` 判断是否将收入/支出折算为单一主货币 | `balance-in-{code}`、`spent-in-{code}`、`earned-in-{code}`、`bills-paid/unpaid-in-{code}` 是按多币种分组还是按单一主货币合并 |
+| `GET /api/v1/chart/account/overview` | [AccountController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Api/V1/Controllers/Chart/AccountController.php#L77-L171) | `$this->convertToPrimary` 传入 `Steam::finalAccountBalanceInRange()` | 返回数据包含 `entries`（原始币种）+ `pc_entries`（折算后主货币）；只有开关开启时 pc_entries 才可用 |
+| `GET /api/v1/accounts/{id}` | [AccountTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Transformers/AccountTransformer.php#L58-L158) + [AccountEnrichment.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Support/JsonApi/Enrichments/AccountEnrichment.php#L241-L257) | 构造时读 `Amount::convertToPrimary()`，决定是否填充 `pc_*` 字段 | `pc_current_balance`、`pc_opening_balance`、`pc_virtual_balance`、`pc_debt_amount`、`pc_balance_difference`；开关关闭时这些字段为 `null` |
+| `GET /json/box/balance` | [BoxController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Http/Controllers/Json/BoxController.php#L62-L137) | `$this->convertToPrimary` 决定 `Amount::getAmountFromJournal()` 取 `amount` 还是 `pc_amount` | 各币种汇总的 `sums`、`incomes`、`expenses` 按主货币合并还是按原币种分桶 |
+| `GET /json/box/net-worth` | [BoxController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Http/Controllers/Json/BoxController.php#L142-L189) | 内部调用 `NetWorth::byAccounts()` 受开关影响 | 净资产按多币种还是按主货币展示 |
+
+### 8.3 前端组件的消费方式
+
+| 组件 | 文件 | 消费方式 | 展示差异 |
+|------|------|----------|----------|
+| **accounts.js（账户图表）** | [accounts.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/accounts.js#L102-L119) | `this.convertToPrimary ? Object.values(current.pc_entries) : Object.values(current.entries)`；Y 轴也分别用 `primary_currency_code` 或 `currency_code` | 开启：多条曲线合并到主货币单 Y 轴；关闭：每账户一条独立 Y 轴（多币种图表） |
+| **accounts.js（账户列表）** | [accounts.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/accounts.js#L257-L258) | `formatMoney(parent.attributes.current_balance, currency_code)` 或 `formatMoney(parent.attributes.pc_current_balance, primary_currency_code)` | 卡片展示账户货币余额 vs 主货币折算余额 |
+| **boxes.js（汇总盒子）** | [boxes.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/pages/dashboard/boxes.js#L90-L139) | 直接消费 Summary API 返回的 `balance-in-{code}` key，根据 currency_code 用 `formatMoney()` | 开启时只有一个主货币盒子；关闭时每种货币独立盒子 |
+| **format-money.js** | [format-money.js](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/resources/assets/v2/src/util/format-money.js#L23-L37) | 使用浏览器 `Intl.NumberFormat(locale, {style:'currency', currency: code})` | 完全由 locale + ISO 4217 货币代码决定符号、小数点、千分位格式 |
+
+---
+
+## 9. 区间余额未折算场景深度分析
+
+### 9.1 场景定义
+
+"区间余额未折算" = `convertToPrimary = false` 时调用 `Steam::finalAccountBalanceInRange()`。
+
+核心代码位于 [Steam.php#L508-L511](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Support/Steam.php#L508-L511)：
+
+```php
+if (!$convertToPrimary) {
+    $currentBalance['balance'] = bcadd((string) $currentBalance['balance'], $sumOfDay);
+}
+```
+
+### 9.2 数据流：未折算 vs 折算对比
+
+| 步骤 | 未折算 (convertToPrimary=false) | 折算 (convertToPrimary=true) |
+|------|----------------------------------|-------------------------------|
+| **起始余额** | `accountsBalancesOptimized(..., false)`：返回结构 `['EUR' => '1000', 'USD' => '500', 'balance' => '1500']`（`balance` 等于账户货币的和） | `accountsBalancesOptimized(..., true)`：返回结构多了 `pc_balance`，为所有币种折入主货币的总和 |
+| **每日累加** | 所有币种变动直接累加到 `balance` 字段，不做汇率转换 | 分两条线：<br>1) 原币种 → 折算 → 累加到 `pc_balance`<br>2) 仅当币种匹配账户货币时 → 累加到 `balance` |
+| **返回字段** | `['EUR' => '...', 'USD' => '...', 'balance' => '...']`（无 `pc_balance`） | `['EUR' => '...', 'USD' => '...', 'balance' => '...', 'pc_balance' => '...']` |
+| **Chart API 消费** | [AccountController.php#L163-L166](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Api/V1/Controllers/Chart/AccountController.php#L163-L166)：只取 `entries[$label] = $previous`；`pc_entries` 数组存在但为空 | `entries[$label] = $previous; pc_entries[$label] = $pcPrevious` |
+| **前端显示** | `accounts.js` L114-119：用 `entries` + `currency_code`，多账户可能生成多条 Y 轴 | `accounts.js` L103-113：用 `pc_entries` + `primary_currency_code`，所有账户同一条 Y 轴 |
+
+### 9.3 未折算场景的典型问题与数据含义
+
+#### 问题 1：多币种账户 `balance` 字段是无意义的数值累加
+
+当账户发生过多币种交易（例如美元账户有一笔欧元收入）：
+
+```
+未折算时：
+  美元账户 balance = 期初 USD 1000 + EUR 收入 500 = 1500
+  （实际上 500 EUR ≈ 540 USD，但未折算时直接数字相加得到 1500）
+```
+
+此时 `balance` 字段是**不同币种的数值直接字符串相加**，货币单位混合，没有真实经济含义。
+
+但 `$currentBalance['EUR']` 和 `$currentBalance['USD']` 两个分币种字段仍然准确。
+
+#### 问题 2：前端图表 Y 轴含义模糊
+
+`accounts.js` 在 `convertToPrimary=false` 时：
+
+```javascript
+if (!this.convertToPrimary) {
+    yAxis = 'y' + current.currency_code;   // 每个账户用自己的货币 code 做 Y 轴 key
+    collection = Object.values(current.entries);  // 取 entries（未折算）
+}
+```
+
+这意味着：
+- 两个同币种账户共享同一 Y 轴 → 数值可比较 ✅
+- 两个不同币种账户在同一图表中 → 两条曲线同 Y 轴但单位不同 ❌（视觉上有误导性）
+- 前端用 `formatMoney(value, currency_code)` 格式化 Y 轴刻度，但 Chart.js 无法区分不同曲线的 Y 轴
+
+#### 问题 3：AccountTransformer 的 `pc_*` 字段为 null
+
+关闭开关时 [AccountEnrichment.php#L241-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Support/JsonApi/Enrichments/AccountEnrichment.php#L241-L257) 的 `if` 分支不执行：
+
+```php
+if ($this->convertToPrimary && $currency->id !== $this->primaryCurrency->id) {
+    // 这整个块不执行
+    $pcCurrentBalance = $converter->convert(...);
+}
+if ($this->convertToPrimary && $currency->id === $this->primaryCurrency->id) {
+    // 这整个块也不执行
+    $pcCurrentBalance = $currentBalance;
+}
+// 结果：pcCurrentBalance = null（初始值）
+```
+
+前端 `accounts.js` L258 的处理：
+
+```javascript
+pc_current_balance: null === parent.attributes.pc_current_balance 
+    ? null 
+    : formatMoney(parent.attributes.pc_current_balance, parent.attributes.primary_currency_code),
+```
+
+→ 用户侧看到账户列表卡片上主货币余额位置为空白。
+
+### 9.4 Summary API 在未折算场景的行为
+
+[BasicController::getBalanceInformation()](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Api/V1/Controllers/Summary/BasicController.php#L210-L224)：
+
+```php
+if (!$convertToPrimary) {
+    // 按原始 currency_id 分桶：收入、支出各算各的
+    foreach ([$expenses, $incomes] as $array) {
+        foreach ($array as $entry) {
+            $sums[$currencyId]['sum'] = bcadd(..., $entry['sum']);
+        }
+    }
+}
+```
+
+返回结果示例（未折算）：
+
+```json
+{
+  "balance-in-EUR": {"monetary_value": "1200.00", "currency_code": "EUR", ...},
+  "balance-in-USD": {"monetary_value":  "800.00", "currency_code": "USD", ...}
+}
+```
+
+→ `boxes.js` 会为每种货币渲染一个独立的余额盒子。
+
+### 9.5 切换开关时的缓存失效机制
+
+| 层级 | 缓存位置 | 失效触发 |
+|------|----------|----------|
+| 后端 SQL 结果 | `CacheProperties`（通常是 Laravel Cache） | key 包含 `$convertToPrimary` → 切换后 key 不同，自然不命中 |
+| 前端 store（Pinia/Vuex 类似） | `window.store` | `setVariable()` 直接覆盖新值；`observe()` 监听器触发 reload |
+| 前端图表数据 | `chartData` 局部变量 + `window.store` 带 cacheKey | 切换开关时前端 JS 显式设为 `null`，强制重新请求 |
+| 前端账户列表 | `accountList` 局部变量 | 切换开关时前端 JS 显式设为 `[]`，强制重新请求 |
+
+---
+
+## 10. 完整交互流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -410,8 +659,11 @@ convertToPrimary 开启 且 主货币ID ≠ 交易货币ID？
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 总结：三个关键决策点
+### 总结：六个关键决策点
 
-1. **`convertToPrimary` 开关**：决定余额字段是取原生 `amount/balance` 还是折算后的 `native_amount/pc_balance`
-2. **`currencyPreference` + `locale`**：决定格式化时的货币符号、小数点/千分位、正负号位置
-3. **账户货币 vs 主货币**：决定单账户展示时显示哪种货币，以及汇总时是否需要汇率折算
+1. **偏好持久化层**：`Preferences::set('convert_to_primary', value)` → 触发 `UserGroupChangedPrimaryCurrency` 事件 → `PrimaryAmountRecalculationService` 批量重算交易表 `native_amount`
+2. **后端注入层**：基类 [Controller.php](file:///d:/fz/0601-2/solo-dogfeeding/code/31-firefly-iii/app/Http/Controllers/Controller.php#L148-L152) 的 middleware 每个请求重新读 `Amount::convertToPrimary()`，结果同时赋给 `$this->convertToPrimary` 和 `View::share`
+3. **API 字段结构层**：开关决定返回数据是否包含 `pc_*` 字段族（`pc_entries`、`pc_current_balance`、`pc_balance`），关闭时这些字段为 null 或不存在
+4. **余额数值层**：开关决定区间余额追踪是用"各币种数值直接相加"还是"全部折算为主货币后求和"——前者在多币种场景下 `balance` 字段单位混合、经济含义失真
+5. **前端展示层**：开关决定图表用单 Y 轴（主货币）还是多 Y 轴（各账户货币）；账户卡片上主货币余额位置在开关关闭时显示为空白
+6. **缓存失效层**：后端 Cache key 含 `$convertToPrimary` 自动隔离，前端靠 Alpine.js `$dispatch('convert-to-primary')` 事件广播 + 显式清空局部变量触发重新加载
