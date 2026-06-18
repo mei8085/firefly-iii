@@ -48,6 +48,12 @@ Cron::handle()
           → handleRepetitions()          # 逐个处理重复规则
             → handleOccurrences()        # 逐个处理发生日期
               → handleOccurrence()       # 当天则创建交易
+                → getTransactionData()
+                  → RecurringRepository::getBillId()  # 从 rt_meta 读取 bill_id
+                  → TransactionGroupRepository::store()
+                    → TransactionGroupFactory::create()
+                      → TransactionJournalFactory::createJournal()
+                        → TransactionJournal::create()  # bill_id 写入 transaction_journals
           → event(TransactionGroupsRequestedReporting)  # 事后通知
 ```
 
@@ -113,10 +119,55 @@ $this->recurrences = $this->repository->getAll();  // 从 recurrences 表获取�
 
 [getBillId()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Recurring/RecurringRepository.php#L146-L158)
 
+`getBillId()` 的实现非常直接：
+
+```php
+public function getBillId(RecurrenceTransaction $recurrence): int
+{
+    $meta = $recurrence->recurrenceTransactionMeta()
+        ->where('name', 'bill_id')
+        ->first();
+    return null !== $meta ? (int) $meta->value : 0;
+}
+```
+
+它从 `rt_meta` 表中查找 `name='bill_id'` 的记录，读取其 `value` 字段。
+
 4. 调用 `groupRepository->store($array)` 创建 `TransactionGroup`
 5. 更新 Recurrence 的 `latest_date` 为当天
 
-**步骤五：事后事件通知**
+**步骤五：交易创建时 bill_id 的落库链路**
+
+当 `groupRepository->store($data)` 被调用后，bill_id 的传递路径如下：
+
+[TransactionGroupRepository::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php#L349-L380)
+
+→ 委托给 [TransactionGroupFactory::create()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/TransactionGroupFactory.php#L57-L90)
+
+→ 调用 [TransactionJournalFactory::create()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/TransactionJournalFactory.php#L230-L369) 的 `createJournal()` 方法
+
+在 `createJournal()` 中：
+
+```php
+// L247: 从 $row['bill_id'] 查找 Bill 对象
+$bill = $this->billRepository->findBill((int) $row['bill_id'], $row['bill_name']);
+
+// L248: 只有 WITHDRAWAL 类型交易才允许关联 bill
+$billId = TransactionTypeEnum::WITHDRAWAL->value === $type->type && $bill instanceof Bill ? $bill->id : null;
+
+// L330-L342: 创建 TransactionJournal 时写入 bill_id
+$journal = TransactionJournal::create([
+    ...
+    'bill_id' => $billId,
+    ...
+]);
+```
+
+`bill_id` 最终保存在 `transaction_journals` 表的 `bill_id` 列中。[TransactionJournal 模型](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/TransactionJournal.php#L60-L72) 的 fillable 字段包含 `bill_id`。
+
+**关键约束**：只有交易类型为 `WITHDRAWAL` 时，bill_id 才会被实际写入。Deposit 和 Transfer 类型的 bill_id 会被强制置为 null——这是因为账单本质上追踪的是支出。
+
+**步骤六：事后事件通知**
 
 ```php
 event(new TransactionGroupsRequestedReporting($userId, $journals));
@@ -134,9 +185,169 @@ event(new TransactionGroupsRequestedReporting($userId, $journals));
 
 ---
 
-## 三、链路二：账单到期提醒（Bill Warning）
+## 三、Recurrence 保存时 bill_id 的写入链路
 
-### 3.1 调用链路总览
+### 3.1 Recurrence 交易模板中 bill_id 的存储结构
+
+Recurrence 的交易模板由三层模型构成：
+
+```
+Recurrence (recurrences 表)
+ └─ RecurrenceTransaction (recurrences_transactions 表)
+      └─ RecurrenceTransactionMeta (rt_meta 表)
+           ├─ name='bill_id'       → value=账单ID
+           ├─ name='budget_id'     → value=预算ID
+           ├─ name='category_id'   → value=分类ID
+           ├─ name='piggy_bank_id' → value=存钱罐ID
+           └─ name='tags'          → value=JSON数组
+```
+
+[RecurrenceTransactionMeta 模型](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/RecurrenceTransactionMeta.php#L33-L56)
+
+- 表名：`rt_meta`
+- 关键字段：`rt_id`（关联 RecurrenceTransaction）、`name`、`value`（存储为 string）
+- bill_id 存储方式：`name='bill_id'`, `value='123'`（string 形式的 ID）
+
+### 3.2 Web 表单保存入口
+
+**创建 Recurrence**：
+
+[CreateController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/CreateController.php#L228-L269)
+
+```php
+$data     = $request->getAll();
+$recurrence = $this->repository->store($data);
+```
+
+**更新 Recurrence**：
+
+[EditController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/EditController.php#L182-L215)
+
+```php
+$data       = $request->getAll();
+$recurrence = $this->repository->update($recurrence, $data);
+```
+
+### 3.3 请求数据提取 — RecurrenceFormRequest
+
+[RecurrenceFormRequest::getAll()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php#L58-L150)
+
+表单提交时，`bill_id` 从 HTTP 请求字段提取并放入交易模板数组：
+
+```php
+// L84: 从表单字段 'bill_id' 提取
+'transactions' => [[
+    ...
+    'bill_id' => $this->convertInteger('bill_id'),
+    'bill_name' => null,
+    ...
+]],
+```
+
+验证规则 [rules()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php#L155-L236)：
+
+```php
+// L188: bill_id 必须存在于 bills 表且属于当前用户
+'bill_id' => ['mustExist:bills,id', 'belongsToUser:bills,id', 'nullable'],
+```
+
+### 3.4 创建 Recurrence 时的 bill_id 写入
+
+[RecurrenceFactory::create()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/RecurrenceFactory.php#L60-L138)
+
+流程：
+
+1. 解析 `$data['recurrence']` 基本字段并创建 `Recurrence` 主记录
+2. 调用 `$this->createRepetitions()` 创建重复规则
+3. 调用 `$this->createTransactions()` 创建交易模板（含 bill_id）
+
+`createTransactions()` 方法由 [RecurringTransactionTrait](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php#L94-L166) 提供：
+
+```php
+// L94-L166: createTransactions()
+// L135-L145: 创建 RecurrenceTransaction 主记录（不含 bill_id）
+$transaction = new RecurrenceTransaction([
+    'recurrence_id'           => $recurrence->id,
+    'transaction_currency_id' => $currency->id,
+    'source_id'               => $source->id,
+    ...
+]);
+$transaction->save();
+
+// L150-L152: 如果 $array 包含 bill_id 键，调用 setBill()
+if (array_key_exists('bill_id', $array)) {
+    $this->setBill($transaction, (int) $array['bill_id']);
+}
+```
+
+核心方法 [setBill()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php#L275-L295)：
+
+```php
+private function setBill(RecurrenceTransaction $transaction, int $billId): void
+{
+    $billFactory = app(BillFactory::class);
+    $billFactory->setUser($transaction->recurrence->user);
+    $bill = $billFactory->find($billId, null);  // 校验 billId 有效性
+
+    if (null === $bill) {
+        // bill 不存在，删除之前的关联（如果有）
+        $transaction->recurrenceTransactionMeta()
+            ->where('name', 'bill_id')->delete();
+        return;
+    }
+
+    // bill 有效，创建或更新 rt_meta 记录
+    $meta = $transaction->recurrenceTransactionMeta()
+        ->where('name', 'bill_id')->first();
+
+    if (null === $meta) {
+        $meta        = new RecurrenceTransactionMeta();
+        $meta->rt_id = $transaction->id;
+        $meta->name  = 'bill_id';
+    }
+    $meta->value = $bill->id;  // 注意：存入的是 string 类型
+    $meta->save();
+}
+```
+
+### 3.5 更新 Recurrence 时的 bill_id 处理
+
+[RecurrenceUpdateService::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php#L55-L109)
+
+更新时 bill_id 的处理在 `updateTransactions()` → `updateCombination()` 中：
+
+1. [updateTransactions()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php#L283-L326)：
+   - 将已有的交易模板与提交的数据按 `id` 进行匹配（匹配成功则更新，未匹配则删除，多余的提交项则新增）
+   
+2. [updateCombination()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php#L161-L241)：
+   - 首先更新 `RecurrenceTransaction` 主记录的字段（金额、账户等）
+   - **L219-L221**：如果提交数据包含 `bill_id`，调用 `$this->setBill()` 更新关联
+
+```php
+if (array_key_exists('bill_id', $submitted)) {
+    $this->setBill($transaction, (int) $submitted['bill_id']);
+}
+```
+
+`setBill()` 方法同样来自 `RecurringTransactionTrait`，逻辑与创建时完全一致。
+
+### 3.6 保存入口汇总
+
+| 入口 | 路由/方法 | 代码位置 |
+|------|-----------|----------|
+| Web 创建 | `POST /recurring` | [CreateController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/CreateController.php#L228-L269) |
+| Web 更新 | `POST /recurring/{id}` | [EditController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/EditController.php#L182-L215) |
+| API 创建 | `POST /api/v1/recurrences` | [Json/RecurrenceController](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Json/RecurrenceController.php) |
+| 数据提取 | 统一请求类 | [RecurrenceFormRequest::getAll()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php#L58-L150) |
+| 创建逻辑 | Factory | [RecurrenceFactory::create()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/RecurrenceFactory.php#L60-L138) |
+| 更新逻辑 | Service | [RecurrenceUpdateService::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php#L55-L109) |
+| bill_id 写入 | Trait | [RecurringTransactionTrait::setBill()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php#L275-L295) |
+
+---
+
+## 四、链路二：账单到期提醒（Bill Warning）
+
+### 4.1 调用链路总览
 
 ```
 Cron::handle()
@@ -145,7 +356,12 @@ Cron::handle()
       → BillWarningCronjob::fireWarnings()
         → WarnAboutBills::handle()       # 核心业务 Job
           ├── 遍历所有用户 → 所有活跃 Bill
-          ├── 过期检查：SubscriptionEnrichment → BillDateCalculator → needsOverdueAlert()
+          ├── getDates()
+          │   └── SubscriptionEnrichment::enrichSingle()
+          │       ├── collectPaidDates()        # 从 transaction_journals 查询已付款
+          │       └── collectPayDates()         # 用 BillDateCalculator 计算预期付款日
+          │           └── BillDateCalculator::getPayDates()
+          ├── 过期检查：needsOverdueAlert()
           │   └── event(SubscriptionsAreOverdueForPayment)
           │       └── NotifiesAboutOverdueSubscriptions
           │           └── NotificationSender → SubscriptionsOverdueReminder
@@ -155,9 +371,9 @@ Cron::handle()
                       └── NotificationSender → BillReminder
 ```
 
-### 3.2 各环节详解
+### 4.2 各环节详解
 
-#### 3.2.1 BillWarningCronjob — 频率控制
+#### 4.2.1 BillWarningCronjob — 频率控制
 
 [BillWarningCronjob.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/Cronjobs/BillWarningCronjob.php#L38-L100)
 
@@ -165,7 +381,7 @@ Cron::handle()
 - 同样 12 小时内不重复执行（除非 `--force`）
 - 执行完毕后更新 `last_bw_job`
 
-#### 3.2.2 WarnAboutBills — 核心业务 Job
+#### 4.2.2 WarnAboutBills — 核心业务 Job
 
 [WarnAboutBills.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Jobs/WarnAboutBills.php#L44-L199)
 
@@ -217,7 +433,121 @@ return in_array($diff, $list, true);
 'bill_reminder_periods' => [90, 30, 14, 7, 0],
 ```
 
-#### 3.2.3 日期计算引擎 — BillDateCalculator
+### 4.3 账单读取已付款记录的查询链路
+
+#### 4.3.1 WarnAboutBills::getDates() 入口
+
+[WarnAboutBills::getDates()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Jobs/WarnAboutBills.php#L127-L156)
+
+```php
+private function getDates(Bill $bill): array
+{
+    $enrichment = new SubscriptionEnrichment();
+    $enrichment->setUser($bill->user);
+    $enrichment->setStart($this->start);
+    $enrichment->setEnd($this->date);
+
+    $bill = $enrichment->enrichSingle($bill);
+    $meta = $bill->meta;
+
+    return [
+        'pay_dates'     => $meta['pay_dates']     ?? [],
+        'paid_dates'    => $meta['paid_dates']    ?? [],
+        'last_paid_date' => $meta['last_paid_date'] ?? null,
+    ];
+}
+```
+
+#### 4.3.2 SubscriptionEnrichment::collectPaidDates() — 已付款记录查询
+
+这是核心查询方法，位于 [SubscriptionEnrichment.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php#L234-L349)
+
+查询 SQL 的逻辑如下：
+
+```php
+// L248-L258: 准备日期范围
+$start = clone $this->start;
+$searchStart = clone $start;
+$start->subDay();  // 起始日期减 1 天作为上一周期的容错
+
+$end = clone $this->end;
+$searchEnd = clone $end;
+$searchStart->startOfDay();
+$searchEnd->endOfDay();
+
+// L263-L288: 执行多表 JOIN 查询
+$set = $this->user
+    ->transactionJournals()           // 从 transaction_journals 表
+    ->whereIn('bill_id', $this->subscriptionIds)  // 过滤：bill_id 在目标账单列表中
+    ->leftJoin('transactions', 'transactions.transaction_journal_id', '=', 'transaction_journals.id')
+    ->leftJoin('transaction_currencies AS currency', ...)
+    ->leftJoin('transaction_currencies AS foreign_currency', ...)
+    ->where('transactions.amount', '>', 0)  // 只看正向金额（支出交易的正向侧）
+    ->before($searchEnd)                    // 日期范围：≤ 搜索结束日
+    ->after($searchStart)                   // 日期范围：≥ 搜索开始日
+    ->get([
+        'transaction_journals.id',
+        'transaction_journals.date',        // 交易日期 = 付款日
+        'transaction_journals.bill_id',     // 关联的账单 ID
+        'transaction_journals.transaction_group_id',
+        'transactions.amount',
+        ...
+    ]);
+```
+
+查询核心要点：
+
+| 要素 | 说明 |
+|------|------|
+| 表 | `transaction_journals` JOIN `transactions` |
+| 关联条件 | `transaction_journals.bill_id IN (账单ID列表)` |
+| 金额过滤 | `transactions.amount > 0`（正向金额 = 支出方） |
+| 日期范围 | `searchStart ≤ date ≤ searchEnd` |
+| 返回字段 | `date`（付款日期）、`bill_id`、`amount` 等 |
+
+查询结果 `$set` 是一个包含所有关联账单的 `transaction_journals` 记录集合。
+
+然后，通过 `lastPaidDate()` 方法按账单 ID 分组，找到每个账单的最近一次付款日期：
+
+```php
+// L298: 每个账单获取其最近一次付款日期
+$lastPaidDate = $this->lastPaidDate($subscription, $set, $start);
+
+// L303: 筛选出该账单的所有已付款记录
+$filtered = $set->filter(static fn (TransactionJournal $journal): bool => (int) $journal->bill_id === (int) $subscription->id);
+```
+
+#### 4.3.3 BillRepository 层面的查询 API
+
+除了 SubscriptionEnrichment 的内部查询外，BillRepository 也提供了可复用的查询方法：
+
+[BillRepository::getPaidDatesInRange()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Bill/BillRepository.php#L321-L349)
+
+```php
+public function getPaidDatesInRange(Bill $bill, Carbon $start, Carbon $end): Collection
+{
+    return $bill
+        ->transactionJournals()          // 使用 Bill 模型的 transactionJournals 关系
+        ->leftJoin('transactions', ...)
+        ->where('transactions.amount', '>', 0)
+        ->before($end)
+        ->after($start)
+        ->get([...]);
+}
+```
+
+Bill 模型的 [transactionJournals 关系](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/Bill.php#L167-L170)：
+
+```php
+public function transactionJournals(): HasMany
+{
+    return $this->hasMany(TransactionJournal::class);
+}
+```
+
+这通过 `transaction_journals.bill_id = bills.id` 的外键关系进行查询。
+
+#### 4.3.4 预期付款日的计算 — BillDateCalculator
 
 [BillDateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/Models/BillDateCalculator.php#L32-L173)
 
@@ -230,67 +560,180 @@ return in_array($diff, $list, true);
 5. 处理月末边界情况（如 30 号的账单在 2 月的处理）
 6. 结果必须晚于 `lastPaid` 日期（排除已付款的周期）
 
-#### 3.2.4 SubscriptionEnrichment — 数据富化
+注意：`getPayDates()` 接收 `$lastPaid` 参数——**只有在 lastPaid 之后的预期付款日才会被返回**，这确保了已付款的周期不会再出现在未付款列表中。
 
-[SubscriptionEnrichment.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php#L46-L481)
+#### 4.3.5 已付款记录的查询方式汇总
 
-为 Bill 对象附加元数据：
-
-| 元数据 | 来源 | 说明 |
-|--------|------|------|
-| `pay_dates` | `BillDateCalculator::getPayDates()` | 当前周期内预期应付款日列表 |
-| `paid_dates` | 数据库查询 `transaction_journals`（`bill_id` 匹配） | 当前周期内已付款日列表 |
-| `last_paid_date` | `paid_dates` 中的最晚日期 | 最近一次付款日 |
-| `nem` | `pay_dates[0]` | 下一个预期付款日（Next Expected Match） |
-| `nem_diff` | `nem` 与今天的人性化差值 | 如"3 天后" |
-
-#### 3.2.5 事件与监听器
-
-**过期事件**：
-
-[SubscriptionsAreOverdueForPayment](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Events/Model/Subscription/SubscriptionsAreOverdueForPayment.php#L31-L38)
-
-- 携带 `User` 和 `$overdue` 数组（每个元素含 `bill` + `dates`）
-
-[NotifiesAboutOverdueSubscriptions](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutOverdueSubscriptions.php#L35-L82)
-
-- 去重：通过偏好 `bill_overdue_{id}_{hash}` 防止同一过期状态重复通知
-- 检查用户偏好 `notification_bill_reminder`（默认开启）
-- 发送 `SubscriptionsOverdueReminder` 通知
-
-**到期/续期事件**：
-
-[SubscriptionNeedsExtensionOrRenewal](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Events/Model/Subscription/SubscriptionNeedsExtensionOrRenewal.php#L31-L39)
-
-- 携带 `Bill`、`field`（`end_date` 或 `extension_date`）、`diff`（天数差）
-
-[NotifiesAboutExtensionOrRenewal](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Listeners/Model/Subscription/NotifiesAboutExtensionOrRenewal.php#L34-L52)
-
-- 检查用户偏好 `notification_bill_reminder`
-- 发送 `BillReminder` 通知
-
-#### 3.2.6 通知投递
-
-所有通知通过统一入口发送：
-
-[NotificationSender::send()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Notifications/NotificationSender.php#L37-L68)
-
-- 自动识别用户语言偏好
-- 支持 Mail / Slack / Pushover 渠道
-- 渠道选择由 `ReturnsAvailableChannels::returnChannels()` 根据用户配置决定
-
-**两种通知类**：
-
-| 通知类 | 触发场景 | 渠道 |
-|--------|----------|------|
-| [BillReminder](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Notifications/User/BillReminder.php#L39-L120) | `end_date`/`extension_date` 临近 | Mail、Slack、Pushover |
-| [SubscriptionsOverdueReminder](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Notifications/User/SubscriptionsOverdueReminder.php#L36-L126) | 账单逾期未付 | Mail、Slack、Pushover |
+| 场景 | 代码位置 | 查询方式 |
+|------|----------|----------|
+| Cron 过期提醒 | [SubscriptionEnrichment::collectPaidDates()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php#L234-L349) | 批量 JOIN 查询 `transaction_journals.bill_id` |
+| 通用 API | [BillRepository::getPaidDatesInRange()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Bill/BillRepository.php#L321-L349) | 通过 `Bill::transactionJournals()` 关系查询 |
+| 模型关系 | [Bill::transactionJournals()](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/Bill.php#L167-L170) | `HasMany` 关系 |
 
 ---
 
-## 四、Bill 与 Recurrence 的协作关系
+## 五、两条链路的协作机制
 
-### 4.1 概念区分
+### 5.1 数据模型关系全景
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                  bills 表 (Bill 模型)                          │
+│  id, name, amount_min, amount_max, date, repeat_freq, skip,    │
+│  active, end_date, extension_date, transaction_currency_id     │
+│                                                               │
+│  关系: transactionJournals() → HasMany                        │
+└──────────────────┬────────────────────────────────────────────┘
+                   │
+                   │ 1:N (通过 bill_id 外键)
+                   ▼
+┌───────────────────────────────────────────────────────────────┐
+│            transaction_journals 表 (TransactionJournal)        │
+│  id, user_id, bill_id, transaction_type_id, description,       │
+│  date, amount, transaction_currency_id                         │
+│                                                               │
+│  ⬆ 这条记录由 Recurrence 链路通过 Cron 自动创建                 │
+│     bill_id 字段 = Recurrence 交易模板中保存的 bill_id          │
+└───────────────────────────────────────────────────────────────┘
+                   ▲
+                   │
+                   │  被 Bill 提醒链路读取，用于计算 paid_dates
+                   │
+┌───────────────────────────────────────────────────────────────┐
+│            rt_meta 表 (RecurrenceTransactionMeta)              │
+│  id, rt_id, name, value                                        │
+│                                                               │
+│  name='bill_id', value='123' ← 用户创建/更新 Recurrence 时写入  │
+│                                                               │
+│  ⬆ 被 Recurrence 链路读取，作为创建交易时的 bill_id 来源         │
+└──────────────────┬────────────────────────────────────────────┘
+                   │
+                   │ N:1 (rt_id → recurrences_transactions.id)
+                   ▼
+┌───────────────────────────────────────────────────────────────┐
+ │      recurrences_transactions 表 (RecurrenceTransaction)      │
+│  id, recurrence_id, source_id, destination_id, amount, ...    │
+└──────────────────┬────────────────────────────────────────────┘
+                   │
+                   │ N:1 (recurrence_id → recurrences.id)
+                   ▼
+┌───────────────────────────────────────────────────────────────┐
+│              recurrences 表 (Recurrence)                       │
+│  id, user_id, title, first_date, repeat_until, latest_date,   │
+│  repetitions, active, apply_rules                              │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 协作时序（单周期视角）
+
+```
+T0: 用户配置阶段
+    ├── 创建 Bill: bills 表新增记录
+    └── 创建 Recurrence: recurrences + recurrences_transactions
+                        + rt_meta(name='bill_id', value=Bill.id)
+
+T1: Cron 执行循环交易任务 (Recurrence 链路)
+    ├── RecurringCronjob 判断时间间隔
+    ├── CreateRecurringTransactions Job
+    │   ├── 获取所有活跃 Recurrence
+    │   ├── 计算今天是否为发生日
+    │   ├── 从 rt_meta 读取 bill_id
+    │   ├── TransactionGroupRepository::store()
+    │   │   └── TransactionJournalFactory::createJournal()
+    │   │       └── TransactionJournal::create(['bill_id' => 123, ...])
+    │   │           ↳ transaction_journals 表新增记录，bill_id=123
+    │   └── 更新 Recurrence.latest_date = 今天
+    └── 结束
+
+T2: Cron 执行账单提醒任务 (Bill 链路)
+    ├── BillWarningCronjob 判断时间间隔
+    ├── WarnAboutBills Job
+    │   ├── 遍历所有活跃 Bill
+    │   ├── SubscriptionEnrichment
+    │   │   ├── collectPaidDates():
+    │   │   │   SELECT ... FROM transaction_journals
+    │   │   │   WHERE bill_id = 123 AND date BETWEEN start AND end
+    │   │   │   → 找到 T1 创建的交易 → 该账单被标记为"已付"
+    │   │   └── collectPayDates():
+    │   │       BillDateCalculator 计算预期付款日
+    │   │       → 只返回 lastPaid 之后的日期
+    │   ├── needsOverdueAlert():
+    │   │   pay_dates 数量 - paid_dates 数量 = 0 → 未过期，不提醒
+    │   └── needsWarning():
+    │       判断 end_date / extension_date
+    └── 结束
+```
+
+### 5.3 bill_id 在两条链路中的流转
+
+```
+  用户表单/API
+      │
+      ▼
+  RecurrenceFormRequest::getAll()
+  ['transactions'][0]['bill_id'] = 123
+      │
+      ▼
+  ┌─────────────────────────────────────┐
+  │  Recurrence 保存链路                │
+  │                                     │
+  │  RecurrenceFactory / UpdateService  │
+  │    → RecurringTransactionTrait      │
+  │       → setBill()                   │
+  │          → rt_meta 表:              │
+  │            rt_id=?, name='bill_id', │
+  │            value='123'              │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │  Recurrence 执行链路 (Cron)         │
+  │                                     │
+  │  CreateRecurringTransactions        │
+  │    → getBillId()                    │
+  │       读取 rt_meta bill_id='123'    │
+  │    → TransactionGroupRepository     │
+  │       → TransactionJournalFactory   │
+  │          → transaction_journals     │
+  │            bill_id = 123            │
+  └──────────────┬──────────────────────┘
+                 │
+                 ▼
+  ┌─────────────────────────────────────┐
+  │  Bill 提醒链路 (Cron)               │
+  │                                     │
+  │  WarnAboutBills                     │
+  │    → SubscriptionEnrichment         │
+  │       → collectPaidDates()          │
+  │          查询 transaction_journals  │
+  │          WHERE bill_id = 123        │
+  │          → 找到已付款记录            │
+  │       → collectPayDates()           │
+  │          BillDateCalculator         │
+  │          基于 lastPaid 计算预期      │
+  │    → 过期判断:                       │
+  │       pay_dates - paid_dates = 0    │
+  │       → 不触发过期提醒               │
+  └─────────────────────────────────────┘
+```
+
+### 5.4 协作的关键保证
+
+1. **bill_id 仅对 WITHDRAWAL 生效**：TransactionJournalFactory 强制非支出交易 bill_id 为 null，防止 Deposit/Transfer 误关联账单。
+
+2. **lastPaid 作为计算锚点**：BillDateCalculator 计算预期付款日时，以 `lastPaid`（最近一次已付款日期）为起点，保证已付款周期不会重复计算。
+
+3. **两链路共用同一张表**：Recurrence 链路写入 `transaction_journals.bill_id`，Bill 链路读取同一字段——这是两条链路协作的唯一数据桥梁。
+
+4. **Cron 执行顺序**：在 [Cron.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Console/Commands/Tools/Cron.php#L99-L129) 中，recurring 任务先执行，subscription warning 后执行。这确保了当天新创建的交易能被同一次 Cron 的账单提醒读取到。
+
+5. **频率一致**：两个 Cronjob 都使用 12 小时最小间隔，保证二者执行节奏基本同步。
+
+---
+
+## 六、Bill 与 Recurrence 的协作关系（补充）
+
+### 6.1 概念区分
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -313,7 +756,7 @@ return in_array($diff, $list, true);
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 协作流程
+### 6.2 协作流程
 
 1. 用户创建一个 Bill，定义预期支出（如"月租 ¥3000，每月 1 日"）
 2. 用户创建一个 Recurrence，设置与 Bill 相同的周期，**并在交易模板中指定 `bill_id`**
@@ -321,7 +764,7 @@ return in_array($diff, $list, true);
    - **Recurrence 链路**：按计划创建交易，交易自动关联到 Bill → Bill 被标记为该周期"已付"
    - **Bill Warning 链路**：检查 Bill 的 `pay_dates` vs `paid_dates`，如果已付则不触发过期提醒
 
-### 4.3 不使用 Recurrence 的情况
+### 6.3 不使用 Recurrence 的情况
 
 如果用户只创建 Bill 而不创建对应 Recurrence：
 - Bill 仍然会计算预期付款日（`pay_dates`）
@@ -330,9 +773,9 @@ return in_array($diff, $list, true);
 
 ---
 
-## 五、关键配置与偏好
+## 七、关键配置与偏好
 
-### 5.1 系统配置
+### 7.1 系统配置
 
 | 配置项 | 位置 | 值 | 说明 |
 |--------|------|----|------|
@@ -340,7 +783,7 @@ return in_array($diff, $list, true);
 | `last_rt_job` | `configuration` 表 | 时间戳 | 循环交易 Job 上次执行时间 |
 | `last_bw_job` | `configuration` 表 | 时间戳 | 账单提醒 Job 上次执行时间 |
 
-### 5.2 用户偏好
+### 7.2 用户偏好
 
 | 偏好键 | 默认值 | 说明 |
 |--------|--------|------|
@@ -348,7 +791,7 @@ return in_array($diff, $list, true);
 | `notification_transaction_creation` | `false` | 是否接收循环交易创建报告 |
 | `bill_overdue_{id}_{hash}` | `false` | 过期通知去重标记（已发送则设为 `true`） |
 
-### 5.3 时间控制
+### 7.3 时间控制
 
 | 参数 | 值 | 说明 |
 |------|----|------|
@@ -358,7 +801,7 @@ return in_array($diff, $list, true);
 
 ---
 
-## 六、Bill 模型关键字段
+## 八、Bill 模型关键字段
 
 [Bill.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/Bill.php#L50-L212)
 
@@ -376,7 +819,7 @@ return in_array($diff, $list, true);
 
 ---
 
-## 七、完整链路时序图
+## 九、完整链路时序图
 
 ```
                         ┌──────────┐
@@ -398,30 +841,30 @@ return in_array($diff, $list, true);
   │ 2.过滤无效记录       │  │  │ ┌──────────────────┐ │
   │ 3.计算发生日期       │  │  │ │过期检查          │ │
   │ 4.当天则创建交易     │  │  │ │Subscription      │ │
-  │   └→ bill_id 关联   │  │  │ │Enrichment        │ │
-  │ 5.更新 latest_date   │  │  │ │  → BillDate      │ │
-  │                      │  │  │ │    Calculator    │ │
-  └──────────┬───────────┘  │  │ │  → pay_dates    │ │
-             │              │  │ │  → paid_dates   │ │
-             ▼              │  │ └──────┬───────────┘ │
-  ┌──────────────────────┐  │  │        │ ≥6天        │
-  │TransactionGroups     │  │  │        ▼              │
-  │RequestedReporting    │  │  │ ┌──────────────────┐ │
-  │   (Event)            │  │  │ │SubscriptionsAre  │ │
-  └──────────┬───────────┘  │  │ │OverdueForPayment │ │
-             │              │  │ │   (Event)        │ │
-             ▼              │  │ └──────┬───────────┘ │
-  ┌──────────────────────┐  │  │        ▼              │
-  │MailsNewTransactions  │  │  │ ┌──────────────────┐ │
-  │Report (Listener)     │  │  │ │NotifiesAbout     │ │
-  │                      │  │  │ │OverdueSubs       │ │
-  │ 检查偏好 → 发送通知   │  │  │ │  (Listener)      │ │
-  └──────────────────────┘  │  │ └──────┬───────────┘ │
-                            │  │        │              │
-                            │  │ ┌──────────────────┐ │
-                            │  │ │到期/续期检查      │ │
-                            │  │ │end_date          │ │
-                            │  │ │extension_date    │ │
+  │   └→ rt_meta 读取   │  │  │ │Enrichment        │ │
+  │      bill_id        │  │  │ │  → BillDate      │ │
+  │   └→ TransactionGroup│ │  │ │    Calculator    │ │
+  │      Repository     │  │  │ │  → pay_dates    │ │
+  │   └→ transaction_   │  │  │ │  → paid_dates   │ │
+  │      journals.bill_id│  │  │ └──────┬───────────┘ │
+  │ 5.更新 latest_date   │  │  │        │ ≥6天        │
+  │                      │  │  │        ▼              │
+  └──────────┬───────────┘  │  │ ┌──────────────────┐ │
+             │              │  │ │SubscriptionsAre  │ │
+             ▼              │  │ │OverdueForPayment │ │
+  ┌──────────────────────┐  │  │ │   (Event)        │ │
+  │TransactionGroups     │  │  │ └──────┬───────────┘ │
+  │RequestedReporting    │  │  │        ▼              │
+  │   (Event)            │  │  │ ┌──────────────────┐ │
+  └──────────┬───────────┘  │  │ │NotifiesAbout     │ │
+             │              │  │ │OverdueSubs       │ │
+             ▼              │  │ │  (Listener)      │ │
+  ┌──────────────────────┐  │  │ └──────┬───────────┘ │
+  │MailsNewTransactions  │  │  │        │              │
+  │Report (Listener)     │  │  │ ┌──────────────────┐ │
+  │                      │  │  │ │到期/续期检查      │ │
+  │ 检查偏好 → 发送通知   │  │  │ │end_date          │ │
+  └──────────────────────┘  │  │ │extension_date    │ │
                             │  │ │  diff ∈ [90,30,  │ │
                             │  │ │   14,7,0]        │ │
                             │  │ └──────┬───────────┘ │
@@ -446,3 +889,37 @@ return in_array($diff, $list, true);
                             │  │    Pushover           │
                             │  └──────────────────────┘
 ```
+
+---
+
+## 十、核心代码索引
+
+### Recurrence 保存相关
+
+| 文件 | 核心方法/类 | 说明 |
+|------|------------|------|
+| [RecurrenceFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/RecurrenceFactory.php) | `create()` | 创建 Recurrence 主流程 |
+| [RecurrenceUpdateService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Update/RecurrenceUpdateService.php) | `update()`, `updateCombination()` | 更新 Recurrence |
+| [RecurringTransactionTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Services/Internal/Support/RecurringTransactionTrait.php) | `setBill()`, `createTransactions()` | bill_id 写入 rt_meta |
+| [RecurrenceFormRequest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Requests/RecurrenceFormRequest.php) | `getAll()` | 从表单提取 bill_id |
+| [CreateController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/CreateController.php) | `store()` | Web 创建入口 |
+| [EditController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Http/Controllers/Recurring/EditController.php) | `update()` | Web 更新入口 |
+
+### Recurrence 执行相关
+
+| 文件 | 核心方法/类 | 说明 |
+|------|------------|------|
+| [CreateRecurringTransactions.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Jobs/CreateRecurringTransactions.php) | `handle()`, `getTransactionData()`, `handleOccurrence()` | 循环交易 Job |
+| [RecurringRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Recurring/RecurringRepository.php) | `getBillId()`, `getAll()`, `getOccurrencesInRange()` | bill_id 读取 + 发生日期计算 |
+| [TransactionGroupRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/TransactionGroup/TransactionGroupRepository.php) | `store()` | 交易保存入口 |
+| [TransactionJournalFactory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Factory/TransactionJournalFactory.php) | `createJournal()` | bill_id 写入 transaction_journals |
+
+### Bill 提醒相关
+
+| 文件 | 核心方法/类 | 说明 |
+|------|------------|------|
+| [WarnAboutBills.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Jobs/WarnAboutBills.php) | `handle()`, `getDates()`, `needsOverdueAlert()` | 账单提醒 Job |
+| [SubscriptionEnrichment.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/JsonApi/Enrichments/SubscriptionEnrichment.php) | `collectPaidDates()`, `collectPayDates()` | 已付款记录查询 + 预期付款日计算 |
+| [BillDateCalculator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Support/Models/BillDateCalculator.php) | `getPayDates()`, `nextDateMatch()` | 日期计算引擎 |
+| [BillRepository.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Repositories/Bill/BillRepository.php) | `getPaidDatesInRange()` | 已付款日期通用查询 |
+| [Bill.php](file:///d:/fz/0601-2/solo-dogfeeding/code/30-firefly-iii/app/Models/Bill.php) | `transactionJournals()` | Bill 与 TransactionJournal 的 HasMany 关系 |
