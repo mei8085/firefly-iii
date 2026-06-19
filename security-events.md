@@ -617,37 +617,59 @@ class NotifiesUserAboutFailedLogin implements ShouldQueue
 
 这一层决定**通过哪些渠道发送通知**。
 
-#### 8.4.1 ReturnsAvailableChannels 渠道选择器
+#### 8.4.1 ReturnsAvailableChannels 渠道选择器的两个分支
 
 **源码**：[ReturnsAvailableChannels.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/ReturnsAvailableChannels.php)
+
+入口方法根据 `$type` 参数分发到两个不同的分支：
 
 ```php
 public static function returnChannels(string $type, ?User $user = null): array
 {
     $channels = ['mail'];  // mail 是基础渠道，始终启用
 
-    if ('user' === $type && $user instanceof User) {
-        return self::returnUserChannels($user);
+    if ('owner' === $type) {
+        return self::returnOwnerChannels();    // 所有者分支：系统级配置
     }
-    return $channels;
+    if ('user' === $type && $user instanceof User) {
+        return self::returnUserChannels($user); // 用户分支：用户级偏好
+    }
+
+    return $channels;  // type 不匹配时只返回 mail
 }
+```
 
-private static function returnUserChannels(User $user): array
+两个分支的核心差异：
+
+| 维度 | 所有者分支（owner） | 用户分支（user） |
+|------|------------------|----------------|
+| **配置存储** | FireflyConfig（全局系统配置） | Preferences（用户级偏好） |
+| **配置表** | `firefly_config` 表 | `preferences` 表 |
+| **Slack 开关** | `config('notifications.channels.slack.enabled')` | `config('notifications.channels.slack.enabled')` |
+| **Pushover 开关** | `config('notifications.channels.pushover.enabled')` | ⚠️ `config('notifications.channels.slack.enabled')` **（bug！）** |
+| **接收对象** | OwnerNotifiable（系统所有者单例） | User 模型实例 |
+
+#### 8.4.2 所有者分支（returnOwnerChannels）
+
+**源码**：[ReturnsAvailableChannels.php 第52-89行](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/ReturnsAvailableChannels.php#L52-L89)
+
+```php
+private static function returnOwnerChannels(): array
 {
-    $channels = ['mail'];
+    $channels = ['mail'];  // mail 始终有
 
-    // Slack：需配置启用 + webhook URL 有效
+    // Slack：全局开关 + 全局 webhook URL
     if (true === config('notifications.channels.slack.enabled', false)) {
-        $slackUrl = (string) Preferences::getEncryptedForUser($user, 'slack_webhook_url', '')->data;
+        $slackUrl = FireflyConfig::getEncrypted('slack_webhook_url', '')->data;
         if (UrlValidator::isValidWebhookURL($slackUrl)) {
             $channels[] = 'slack';
         }
     }
 
-    // Pushover：需配置启用 + app token + user token 都非空
+    // Pushover：全局开关 + 全局 app token + 全局 user token
     if (true === config('notifications.channels.pushover.enabled', false)) {
-        $pushoverAppToken  = (string) Preferences::getEncryptedForUser($user, 'pushover_app_token', '')->data;
-        $pushoverUserToken = (string) Preferences::getEncryptedForUser($user, 'pushover_user_token', '')->data;
+        $pushoverAppToken  = (string) FireflyConfig::getEncrypted('pushover_app_token', '')->data;
+        $pushoverUserToken = (string) FireflyConfig::getEncrypted('pushover_user_token', '')->data;
         if ('' !== $pushoverAppToken && '' !== $pushoverUserToken) {
             $channels[] = PushoverChannel::class;
         }
@@ -657,11 +679,73 @@ private static function returnUserChannels(User $user): array
 }
 ```
 
-**关键细节**：
-- `mail` 渠道始终启用
-- `slack` 需要：`notifications.channels.slack.enabled=true` + 有效的 webhook URL
-- `pushover` 需要：`notifications.channels.pushover.enabled=true` + app token + user token 都非空
+**所有者分支特点**：
+- ✅ Slack：用 `notifications.channels.slack.enabled` 开关，正确
+- ✅ Pushover：用 `notifications.channels.pushover.enabled` 开关，正确
+- 所有配置项从 FireflyConfig（全局）读取
 - `ntfy` 渠道：代码已注释，实际不可用
+
+#### 8.4.3 用户分支（returnUserChannels）
+
+**源码**：[ReturnsAvailableChannels.php 第91-132行](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/ReturnsAvailableChannels.php#L91-L132)
+
+```php
+private static function returnUserChannels(User $user): array
+{
+    $channels = ['mail'];  // mail 始终有
+
+    // Slack：全局开关 + 用户级 webhook URL
+    if (true === config('notifications.channels.slack.enabled', false)) {
+        $slackUrl = (string) Preferences::getEncryptedForUser($user, 'slack_webhook_url', '')->data;
+        if (UrlValidator::isValidWebhookURL($slackUrl)) {
+            $channels[] = 'slack';
+        }
+    }
+
+    // Pushover：⚠️ 注意这里用的是 slack.enabled 开关，不是 pushover.enabled！
+    if (true === config('notifications.channels.slack.enabled', false)) {
+        $pushoverAppToken  = (string) Preferences::getEncryptedForUser($user, 'pushover_app_token', '')->data;
+        $pushoverUserToken = (string) Preferences::getEncryptedForUser($user, 'pushover_user_token', '')->data;
+        if ('' !== $pushoverAppToken && '' !== $pushoverUserToken) {
+            $channels[] = PushoverChannel::class;
+        }
+    }
+
+    // only the owner can get notifications over
+    return $channels;
+}
+```
+
+**用户分支的关键发现**：
+
+| 渠道 | 全局开关 | 用户级配置 | 备注 |
+|------|---------|-----------|------|
+| **mail** | 始终启用 | 无 | 基础渠道 |
+| **slack** | `notifications.channels.slack.enabled` | `slack_webhook_url`（Preferences） | ✅ 逻辑正确 |
+| **pushover** | ⚠️ `notifications.channels.slack.enabled` | `pushover_app_token` + `pushover_user_token`（Preferences） | ❌ **开关用错了！** 用的是 slack 的开关 |
+
+**⚠️ 用户分支 Pushover 的开关 Bug**：
+
+用户分支第116行的条件判断是 `config('notifications.channels.slack.enabled', false)`，而不是预期的 `config('notifications.channels.pushover.enabled', false)`。这意味着：
+
+- 如果 Slack 启用 + Pushover 禁用 → **用户 Pushover 通知反而可以用**（因为走了 slack 开关）
+- 如果 Slack 禁用 + Pushover 启用 → **用户 Pushover 通知反而不能用**
+- 这个 bug 仅影响**用户分支**，所有者分支不受影响（第74行用的是正确的 `pushover.enabled`）
+- 默认配置下（[config/notifications.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/notifications.php#L28-L30)）slack 和 pushover 都默认 `enabled=true`，所以大多数情况下感知不到
+
+**用户分支的其他特点**：
+- 配置项从 Preferences（用户级）读取，每个用户可以配置自己的 webhook / token
+- 第130行注释 "only the owner can get notifications over" 不完整，但代码没有实际限制
+- `ntfy` 渠道：代码已注释，实际不可用
+- 入口检查：必须同时满足 `'user' === $type` 和 `$user instanceof User` 才会进入用户分支
+
+#### 8.4.4 两个分支的启用条件汇总
+
+| 渠道 | 所有者启用条件 | 用户启用条件 |
+|------|-------------|------------|
+| **mail** | 始终启用 | 始终启用 |
+| **slack** | ① `notifications.channels.slack.enabled=true` <br> ② FireflyConfig 中 `slack_webhook_url` 是有效 URL | ① `notifications.channels.slack.enabled=true` <br> ② 用户 Preferences 中 `slack_webhook_url` 是有效 URL |
+| **pushover** | ① `notifications.channels.pushover.enabled=true` <br> ② FireflyConfig 中 `pushover_app_token` 非空 <br> ③ FireflyConfig 中 `pushover_user_token` 非空 | ① ⚠️ `notifications.channels.slack.enabled=true`（bug！）<br> ② 用户 Preferences 中 `pushover_app_token` 非空 <br> ③ 用户 Preferences 中 `pushover_user_token` 非空 |
 
 #### 8.4.2 通知类 via() 方法的额外过滤
 
@@ -1130,4 +1214,4 @@ event(UserSuccessfullyLoggedIn)
     - 层3：渠道过滤（mail始终启用，Slack/Pushover需配置）+ 演示站点排除mail
     - 层4：`NotificationSender` 的 try-catch 吃掉所有异常，不重抛导致队列不重试
     - 层5：新IP登录有 `notified` 去重但**发送失败也标记**，其他通知无去重
-12. **尽力而为的送达保证**：通知送达是 Best Eff
+12. **尽力而为的送达保证**：通知送达是 Best Effort 级别，用户对送达失败完全不知情，只能通过日志发现，sync 模式下发送失败还会阻塞登录流程
