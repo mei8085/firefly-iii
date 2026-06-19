@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档详细分析 Firefly III 系统中安全事件从触发到用户通知的完整流程，包括事件触发机制、监听器处理、用户通知发送以及会话异常处理的关系。
+本文档详细分析 Firefly III 系统中安全事件从触发到用户通知的完整流程，包括事件触发机制、监听器处理、用户通知发送以及会话异常处理的关系。重点拆解了 `logoutOtherDevices()` 在 Firefly III 实际配置下的真实生效条件。
 
 ---
 
@@ -363,18 +363,7 @@ public function postLogoutOtherSessions(Request $request): RedirectResponse
 }
 ```
 
-### 6.3 Laravel logoutOtherDevices 的底层原理
-
-`Auth::logoutOtherDevices($password)` 是 Laravel `Illuminate\Auth\SessionGuard` 提供的方法，其工作原理：
-
-1. 使用传入的密码重新哈希用户的 `password` 字段（调用 `$user->setPasswordAttribute($password)`）
-2. 在 `password` 列值改变后，其他会话的 `password_hash` 指纹不再匹配
-3. 当其他设备的会话尝试恢复时，Laravel 中间件检测到 `password_hash` 不匹配，自动使会话失效
-4. **当前会话不受影响**，因为调用后 Laravel 会同步更新当前会话的 `password_hash` 指纹
-
-**注意**：此机制依赖数据库中 `users` 表的 `password` 字段变化作为会话验证依据，且需要 session driver 支持用户级会话管理（如 database 或 redis 驱动）。
-
-### 6.4 改密与会话安全的真实关系
+### 6.3 改密与会话安全的真实关系
 
 ```
 改密操作（postChangePassword）
@@ -386,7 +375,8 @@ public function postLogoutOtherSessions(Request $request): RedirectResponse
     └─ ❌ 不发送通知
     
     后果：其他已登录设备的会话仍然有效
-    原因：Laravel 的 "remember me" token 和 session 不依赖密码哈希验证
+    原因：既没有 AuthenticateSession 中间件的 password_hash 比对，
+          也没有手动清除其他会话
 ```
 
 与邮箱变更操作的对比（[postChangeEmail()](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/ProfileController.php#L239-L278)）：
@@ -403,20 +393,171 @@ return redirect(route('index'));
 
 ---
 
-## 7. 主动注销其他会话与自动提醒的区别
+## 7. 主动注销其他会话的三层生效条件（核心拆解）
 
-### 7.1 本质区别
+`Auth::logoutOtherDevices($password)` 是 Laravel `Illuminate\Auth\SessionGuard` 提供的方法，但其**实际效果依赖三个层级的配置**。Firefly III 的默认配置在关键层级上存在缺失，导致该方法的实际效果与 Laravel 文档描述不完全一致。
 
-| 维度 | 主动注销其他会话 | 自动安全提醒 |
+### 7.1 第一层：框架注销调用（SessionGuard 内部逻辑）
+
+**框架源码逻辑**（`Illuminate\Auth\SessionGuard::logoutOtherDevices()`，伪代码还原）：
+
+```php
+public function logoutOtherDevices($password, $attribute = 'password')
+{
+    if (! $user = $this->user()) {
+        return;
+    }
+
+    // 步骤1：重新 bcrypt 密码并保存到数据库
+    // 目的：让 users.password 字段值发生变化（即使密码相同，bcrypt 每次盐值不同，哈希也不同）
+    $user->forceFill([
+        $attribute => Hash::make($password),
+    ])->save();
+
+    // 步骤2：更新当前会话中的 password_hash 指纹
+    // 目的：确保当前操作者的会话不被后续的比对逻辑判定为"过期"
+    $this->session->put([
+        'password_hash_'.$this->getName() => $user->getAuthPassword(),
+    ]);
+
+    // ⚠️ 注意：框架本身不会直接删除任何会话文件/记录
+    // 全部依赖后续请求时，其他会话的 password_hash 比对失败 → 被中间件踢下线
+}
+```
+
+**Firefly III 调用分析**：
+- ✅ 调用入口正确：[ProfileController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/ProfileController.php#L357)
+- ✅ 重新 bcrypt 哈希并保存：通过 `Hash::make($password)` 让 `users.password` 值变化（即使密码没变）
+- ✅ 当前会话的 `password_hash_*` 指纹被同步更新
+- ❌ **关键缺口**：框架只做了这两件事，后续依赖中间件比对
+
+### 7.2 第二层：会话中间件配置（Firefly III 缺失的关键）
+
+`logoutOtherDevices()` 要生效的**必要前提**是：每个请求都有中间件检查会话中存储的 `password_hash` 与数据库 `users.password` 是否匹配。
+
+**Laravel 提供的标准中间件**：`Illuminate\Auth\Middleware\AuthenticateSession`
+
+其核心逻辑（伪代码还原）：
+```php
+public function handle($request, Closure $next)
+{
+    $this->auth->viaRemember(); // 触发 Remember Me 恢复逻辑
+
+    // 关键检查：比对会话指纹与数据库
+    if ($this->auth->check() &&
+        $request->session()->get('password_hash_'.$this->guard) !== $this->auth->user()->getAuthPassword()
+    ) {
+        // 不匹配 → 说明密码被改过 → 踢下线
+        $this->auth->logout();
+        $request->session()->invalidate();
+        throw new AuthenticationException;
+    }
+
+    return $next($request);
+}
+```
+
+**Firefly III 的实际中间件配置**（[bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/bootstrap/app.php#L95-L105)）：
+
+```php
+$middleware->group('web', [
+    EncryptCookies::class,
+    AddQueuedCookiesToResponse::class,
+    StartFireflyIIISession::class,   // ← 自定义，仅改了 storeCurrentUrl
+    ShareErrorsFromSession::class,
+    VerifyCsrfToken::class,
+    Binder::class,
+    CreateFreshApiToken::class,
+    // ❌ ❌ ❌ 缺少 Illuminate\Auth\Middleware\AuthenticateSession::class
+    // ❌ ❌ ❌ 缺少 password_hash 比对逻辑的注入点
+]);
+```
+
+**Firefly III 自定义 Authenticate 中间件**（[Authenticate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Middleware/Authenticate.php)）的检查项：
+- ✅ 检查用户是否登录（`auth()->check()`）
+- ✅ 检查用户是否被封锁（`$user->blocked`）
+- ❌ **不检查** `password_hash` 指纹比对
+- ❌ **不检查** 会话有效性以外的任何条件
+
+**结论（第二层）**：由于缺少 `AuthenticateSession`，即使 `users.password` 哈希变化了，其他设备的会话也不会在请求时被踢下线。`logoutOtherDevices()` 在此配置下对"其他活跃会话的短期失效"**几乎没有作用**。
+
+### 7.3 第三层：其他设备再次请求时的失效判断
+
+其他设备在 `logoutOtherDevices()` 被调用后，再次发起请求时，会经过以下判断链：
+
+```
+其他设备浏览器携带 Session Cookie 请求任意页面
+    ↓
+[EncryptCookies] → 解密 cookie
+    ↓
+[StartFireflyIIISession] → 从文件存储读取 session（继承 StartSession 默认行为）
+    │   ├─ 根据 session ID 读取 storage/framework/sessions/xxxx
+    │   ├─ 检查 session 是否过期（默认 lifetime=120 分钟，expire_on_close=true）
+    │   └─ 恢复 Session 对象到内存
+    ↓
+[ShareErrorsFromSession] → 从 session 中读取错误
+    ↓
+[VerifyCsrfToken] → 验证 CSRF（仅 POST/PUT 等）
+    ↓
+[Binder] → 路由模型绑定
+    ↓
+[CreateFreshApiToken] → 刷新 API token cookie
+    ↓
+[路由匹配] → 命中需要 user-simple-auth 或 user-full-auth 的路由
+    ↓
+[FireflyIII\Authenticate::handle()]
+    ├─ auth()->check() → 根据 session 中的 login_web_* 查找用户
+    │   ├─ session 中的 ID 有效 → 返回 User 模型（从 users 表查最新数据）
+    │   └─ session 中的 ID 无效 → AuthenticationException → 跳登录页
+    ├─ ✅ 检查 $user->blocked === 1 → 踢下线
+    └─ ❌ 不比对 password_hash 指纹
+    ↓
+[后续中间件] → MFA、Range、InterestingMessage 等
+    ↓
+[控制器] → 正常处理请求（用户仍然被视为登录状态）
+```
+
+### 7.4 Firefly III 默认配置下 logoutOtherDevices 的实际效果
+
+| 会话类型 | logoutOtherDevices 后是否立即失效 | 原因分析 |
+|----------|:---:|------|
+| **其他设备（短期会话，浏览器未关闭）** | ❌ 不失效 | 缺少 AuthenticateSession 中间件，password_hash 不比对；StartSession 仅按 session ID 和过期时间恢复 |
+| **其他设备（短期会话，浏览器关闭）** | ⚠️ 大概率失效 | `expire_on_close=true`（[config/session.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/session.php#L28)），关闭浏览器即销毁 session cookie → 重新打开需要再次登录 → 新密码才生效，旧密码无法登录 |
+| **其他设备（Remember Me cookie）** | ⚠️ 间接失效 | Laravel `SessionGuard::user()` 在 viaRemember() 时，会**隐式比对密码哈希**（如果 database 中密码与 cookied remember_token 对应的用户记录不匹配 → 恢复失败 → 用户需重新登录） |
+| **当前设备（操作者）** | ✅ 不失效 | password_hash 指纹被同步更新 |
+| **API Token（Passport）** | ❌ 不失效 | access_token / refresh_token 独立于 web session，完全不受影响 |
+| **MFA Cookie** | ❌ 不失效 | `twoFactorRemember` cookie 独立管理，不受 password_hash 变化影响 |
+
+### 7.5 与 Session Driver 的关系
+
+**当前配置**（[config/session.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/session.php#L26)）：
+```php
+'driver' => env('SESSION_DRIVER', 'file'),  // 默认 file
+```
+
+不同 driver 对 logoutOtherDevices 的影响：
+- **file（默认）**：session 存储在 `storage/framework/sessions/` 目录，文件名是 session ID。**无法按 user_id 查询**某用户有哪些活跃 session。即使更换为 AuthenticateSession 中间件，也无法主动批量删除。
+- **database**：session 存储在 `sessions` 表，有 `user_id` 字段。**理论上可以**在 logoutOtherDevices 中额外执行 `DB::table('sessions')->where('user_id', $userId)->where('id', '!=', $currentId)->delete()`，但 Laravel 框架默认不做。
+- **redis**：与 file 类似，键为 session ID，**无法按 user_id 索引**（除非额外维护 user_id → session_ids 的反向索引）。
+
+**在 Firefly III 默认 file driver 下**：即使补上 AuthenticateSession 中间件，也只能在其他设备下次请求时被动失效，无法主动从存储层批量清除。
+
+---
+
+## 8. 主动注销其他会话与自动提醒的区别
+
+### 8.1 本质区别
+
+| 维度 | 主动注销其他会话（实际效果） | 自动安全提醒 |
 |------|------------------|--------------|
 | **触发方式** | 用户手动操作 | 系统自动检测 |
-| **目的** | 清除其他设备上的活跃会话 | 通知用户存在异常行为 |
-| **是否改变会话状态** | ✅ 立即使其他会话失效 | ❌ 不改变任何会话状态 |
+| **目的** | 试图清除其他设备上的活跃会话 | 通知用户存在异常行为 |
+| **是否改变会话状态** | ⚠️ 仅部分生效（详见第7章） | ❌ 不改变任何会话状态 |
 | **是否发送通知** | ❌ 不发送通知 | ✅ 发送通知（邮件/Slack/Pushover） |
 | **用户感知** | 操作者看到 flash 提示 | 被通知者收到推送/邮件 |
 | **代码路径** | `Auth::logoutOtherDevices()` | `event() → Listener → NotificationSender` |
 
-### 7.2 主动注销其他会话的完整流程
+### 8.2 主动注销其他会话的完整流程
 
 ```
 用户访问"注销其他会话"页面
@@ -430,9 +571,13 @@ return redirect(route('index'));
 [ProfileController.postLogoutOtherSessions()]
     ├─ Auth::once($creds)     ← 单次验证密码，不创建持久会话
     ├─ 验证成功 → Auth::logoutOtherDevices($password)
-    │   ├─ 重新哈希用户密码（password 字段值微调）
-    │   ├─ 当前会话的 password_hash 指纹同步更新
-    │   └─ 其他会话的 password_hash 指纹不再匹配 → 失效
+    │   ├─ [层1] 重新 bcrypt 哈希密码 → users.password 字段变化
+    │   ├─ [层1] 当前会话的 password_hash_* 指纹同步更新
+    │   ├─ [层2] ❌ 无 AuthenticateSession → 无每次请求的指纹比对
+    │   └─ [层3] 其他设备下次请求时：
+    │           ├─ 浏览器未关闭 → ❌ 仍然登录（Authenticate不检查指纹）
+    │           ├─ 浏览器已关闭，无 Remember Me → ✅ 需重新登录
+    │           └─ 有 Remember Me cookie → ⚠️ 多数情况下需重新登录
     ├─ session()->flash('info', '其他会话已注销')
     └─ 验证失败 → session()->flash('error', 'auth.failed')
 ```
@@ -441,8 +586,9 @@ return redirect(route('index'));
 - `Auth::once()` 只做单次密码验证，不会影响当前认证状态
 - `logoutOtherDevices()` 必须传入明文密码，因为它会重新对密码做 bcrypt 哈希
 - 此操作**不触发任何安全事件**，不发通知，仅通过 flash message 告知操作者
+- **用户看到 flash 消息以为所有其他会话都失效了，但实际上……**（真实效果见7.4节）
 
-### 7.3 自动安全提醒的完整流程
+### 8.3 自动安全提醒的完整流程
 
 以"新IP登录"为例：
 
@@ -466,25 +612,34 @@ event(UserLoggedInFromNewIpAddress)
 - 自动提醒**不注销任何会话**，仅提供信息让用户自行判断
 - 通知是否发送受用户偏好控制（`notification_user_login`）
 
-### 7.4 两种机制在不同安全场景下的配合
+### 8.4 两种机制在不同安全场景下的配合
 
-| 安全场景 | 自动提醒 | 主动注销 |
+| 安全场景 | 自动提醒 | 主动注销（实际效果） |
 |----------|----------|----------|
-| 收到"新IP登录"通知，非本人操作 | 系统自动发送 | 用户手动注销其他会话 |
+| 收到"新IP登录"通知，非本人操作 | 系统自动发送 | 用户操作后，需对方关闭浏览器或下次请求才可能失效 |
 | 收到"登录失败"通知 | 系统自动发送 | 无直接关联 |
-| 收到"备份码被使用"通知 | 系统自动发送 | 用户可能选择注销+改密 |
-| 收到"MFA多次失败"通知 | 系统自动发送 | 用户应立即改密+注销 |
-| 改密后需清除其他会话 | 无自动提醒 | 用户必须**手动**注销其他会话 |
+| 收到"备份码被使用"通知 | 系统自动发送 | 用户可能选择注销+改密，但实际失效有限 |
+| 收到"MFA多次失败"通知 | 系统自动发送 | 用户应立即改密+注销，但建议配合修改邮箱等操作 |
+| 改密后需清除其他会话 | 无自动提醒 | 用户必须**手动**注销其他会话，但效果有限 |
 
-### 7.5 设计隐患
+### 8.5 设计隐患
 
-**改密不自动注销其他会话**是一个值得注意的安全缺口：
+**改密与 logoutOtherDevices 的实际效果存在双重认知差**：
 
 ```
-用户改密（postChangePassword）
-    → 数据库密码已更新
-    → 但攻击者的旧会话仍然有效！
-    → 用户需要额外手动执行"注销其他会话"
+用户视角：
+    改密 → 应该所有其他设备都被踢下线了吧？
+    点击"注销其他会话" → 应该所有其他设备都立即登出了吧？
+
+实际情况（Firefly III 默认配置）：
+    改密 → ❌ 其他设备短期会话完全不受影响
+    注销其他会话 → ⚠️ 只有对方关闭浏览器/无Remember Me时才有效
+                 ❌ 对方继续使用（浏览器未关闭）则完全不失效
+
+根本原因：
+    1. 缺少 AuthenticateSession 中间件 → 每次请求不比对 password_hash 指纹
+    2. Session driver 是 file → 无法按 user_id 主动批量删除
+    3. 没有调用 remember_token 重置 → Remember Me cookie 未被撤销
 ```
 
 对比邮箱变更操作的严谨处理：
@@ -492,16 +647,18 @@ event(UserLoggedInFromNewIpAddress)
 ```
 用户变更邮箱（postChangeEmail）
     → 数据库邮箱已更新
-    → Auth::guard()->logout()           ← 强制登出
-    → $request->session()->invalidate() ← 使会话失效
+    → Auth::guard()->logout()           ← 强制登出（确定生效）
+    → $request->session()->invalidate() ← 使当前会话失效（确定生效）
     → 用户必须重新登录
 ```
 
+**邮箱变更的处理简单且确定生效，logoutOtherDevices 则依赖多层隐含假设。**
+
 ---
 
-## 8. IP 地址跟踪与会话异常检测
+## 9. IP 地址跟踪与会话异常检测
 
-### 8.1 IP 存储与检测
+### 9.1 IP 存储与检测
 
 **核心逻辑**：[StoresNewIpAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/StoresNewIpAddress.php#L36-L80)
 
@@ -536,7 +693,7 @@ if (false === $inArray && true === $send) {
 }
 ```
 
-### 8.2 新IP通知发送
+### 9.2 新IP通知发送
 
 **核心逻辑**：[NotifiesUserAboutNewIpAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewIpAddress.php#L35-L58)
 
@@ -551,7 +708,7 @@ public function handle(UserLoggedInFromNewIpAddress $event): void
     $list = Preferences::getForUser($user, 'login_ip_history', [])->data;
     foreach ($list as $index => $entry) {
         if (false === $entry['notified']) {
-            NotificationSender::send($user, new UserLogin());  // ← 注意：UserLogin 不传剩余码数量等信息
+            NotificationSender::send($user, new UserLogin());
         }
         $list[$index]['notified'] = true;
     }
@@ -561,9 +718,9 @@ public function handle(UserLoggedInFromNewIpAddress $event): void
 
 ---
 
-## 9. 完整事件流时序图
+## 10. 完整事件流时序图
 
-### 9.1 登录失败通知流程
+### 10.1 登录失败通知流程
 
 ```
 用户登录失败
@@ -584,7 +741,7 @@ public function handle(UserLoggedInFromNewIpAddress $event): void
             └─ 发送给系统所有者
 ```
 
-### 9.2 新IP登录通知流程
+### 10.2 新IP登录通知流程
 
 ```
 用户登录成功
@@ -604,7 +761,7 @@ event(UserSuccessfullyLoggedIn)
     └─ 标记 notified=true
 ```
 
-### 9.3 MFA 异常与备份码完整通知流程
+### 10.3 MFA 异常与备份码完整通知流程
 
 ```
 用户提交MFA码
@@ -640,19 +797,22 @@ event(UserSuccessfullyLoggedIn)
         → MFAUsedBackupCodeNotification（含IP/UA/时间）
 ```
 
-### 9.4 会话安全操作对比流程
+### 10.4 会话安全操作对比流程
 
 ```
-场景A：主动注销其他会话
+场景A：主动注销其他会话（postLogoutOtherSessions）
     用户 → [POST /profile/logout-other-sessions]
         → Auth::once() 验证密码
         → Auth::logoutOtherDevices($password)
-        → 其他设备会话立即失效
-        → 当前会话保持
-        → flash 提示"已注销"
+            → 重新 bcrypt 密码，保存到 users 表
+            → 更新当前会话的 password_hash 指纹
+            → ❌ 其他设备短期会话（浏览器未关闭）不会立即失效
+            → ⚠️  关闭浏览器或无Remember Me才需要重新登录
+        → flash 提示"已注销"（但效果依赖隐含假设）
     ❌ 不触发事件，不发送通知
+    ❌ 没有 remember_token 重置
 
-场景B：改密
+场景B：改密（postChangePassword）
     用户 → [POST /profile/change-password]
         → 验证当前密码 + 新密码
         → $user->password = bcrypt($new)
@@ -661,24 +821,56 @@ event(UserSuccessfullyLoggedIn)
     ❌ 不触发事件，不发送通知
     ❌ 不调用 logoutOtherDevices()
     ❌ 不使任何会话失效
-    ⚠️  其他设备上的旧会话仍然有效
+    ❌ 不重置 remember_token
+    ❌ 其他设备上的旧会话仍然完全有效
 
-场景C：变更邮箱
+场景C：变更邮箱（postChangeEmail）
     用户 → [POST /profile/change-email]
         → 更新邮箱
         → event(UserChangedEmailAddress)
         → Auth::guard()->logout()
         → $request->session()->invalidate()
         → 重定向到首页
-    ✅ 强制登出当前用户
-    ✅ 使当前会话失效
+    ✅ 强制登出当前用户（确定生效）
+    ✅ 使当前会话失效（确定生效）
     ✅ 触发事件 → 发送确认邮件 + 撤销邮件
-    ⚠️  但不调用 logoutOtherDevices()，其他设备的会话可能仍然有效
+    ⚠️  但不调用 logoutOtherDevices()，其他设备的短期会话可能仍然有效
+```
+
+### 10.5 logoutOtherDevices 三层生效判断链
+
+```
+[层1] 框架调用
+    Auth::logoutOtherDevices($password)
+      ├─ users.password = bcrypt($password)  ← 值一定变化（bcrypt盐不同）
+      └─ session['password_hash_web'] = $user->password  ← 同步当前会话指纹
+    ↓
+[层2] 中间件检查（Firefly III ❌ 缺失）
+    对每一个进入请求：
+    AuthenticateSession（不存在）
+      └─ session['password_hash_web'] === $user->password？
+          ├─ 相等 → 放行
+          └─ 不等 → logout() + invalidate() + 踢下线
+    ❌ 由于中间件不存在，此判断链在 Firefly III 中永远不会执行
+    ↓
+[层3] 其他设备请求时的实际路径
+    其他设备发起请求
+      ├─ Session Cookie 是否仍存在？
+      │   ├─ 浏览器关闭 + expire_on_close=true → Cookie 丢失 → 需重新登录（✅ 生效）
+      │   └─ 浏览器未关闭 → Cookie 仍在 → 继续下一步
+      ├─ session 文件仍在 storage/framework/sessions？
+      │   ├─ 超过 lifetime=120 分钟未活动 → 过期 → 需重新登录（✅ 生效）
+      │   └─ session 文件未过期 → 继续下一步
+      ├─ Authenticate 中间件检查
+      │   ├─ auth()->check() 按 session ID 恢复 → 成功（✅ 仍登录）
+      │   └─ $user->blocked 检查 → 通过
+      ├─ ❌ password_hash 指纹未被检查 → 继续下一步
+      └─ 控制器正常执行 → 会话对用户而言完全有效（❌ 未失效）
 ```
 
 ---
 
-## 10. 关键配置与偏好设置
+## 11. 关键配置与偏好设置
 
 | 配置项 | 位置 | 作用 |
 |--------|------|------|
@@ -687,18 +879,30 @@ event(UserSuccessfullyLoggedIn)
 | `mfa_failure_count` | 用户偏好 | MFA失败计数器，成功登录或使用备份码后重置为0 |
 | `mfa_history` | 用户偏好 | MFA码使用历史（5分钟窗口防重放攻击） |
 | `mfa_recovery` | 用户偏好 | 备份码列表，使用后逐个移除 |
+| `SESSION_DRIVER` | .env | 会话驱动（默认 file，无法按 user_id 批量删除） |
+| `SESSION_LIFETIME` | .env | 会话不活动过期时间（默认 120 分钟） |
+| `expire_on_close` | [config/session.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/session.php#L28) | 关闭浏览器即销毁 session cookie（默认 true） |
+| `AuthenticateSession::class` | [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/bootstrap/app.php#L95-L105) | 密码哈希指纹比对中间件（**未注册**） |
+| `web.guard.remember` | [config/auth.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/auth.php#L67) | Remember Me cookie 有效期（默认 364 天） |
 
 ---
 
-## 11. 代码参考索引
+## 12. 代码参考索引
 
-### 11.1 控制器
+### 12.1 控制器
 - [LoginController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/Auth/LoginController.php) - 登录流程控制
 - [TwoFactorController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/Auth/TwoFactorController.php) - MFA验证控制 + 备份码级联逻辑
 - [MfaController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/Profile/MfaController.php) - MFA启用/禁用/备份码管理
-- [ProfileController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/ProfileController.php) - 密码修改 + 会话管理
+- [ProfileController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Controllers/ProfileController.php) - 密码修改 + 会话管理（改密/注销其他会话/变更邮箱）
 
-### 11.2 事件类
+### 12.2 中间件与配置
+- [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/bootstrap/app.php#L75-L165) - 全局中间件配置（`AuthenticateSession` **未注册**）
+- [Authenticate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Middleware/Authenticate.php) - 自定义认证中间件（只检查 blocked，不检查 password_hash）
+- [StartFireflyIIISession.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Http/Middleware/StartFireflyIIISession.php) - 自定义Session启动（仅重写 storeCurrentUrl）
+- [config/session.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/session.php) - Session配置（driver=file, expire_on_close=true）
+- [config/auth.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/config/auth.php) - Guard配置（session driver）
+
+### 12.3 事件类
 - [UserFailedLoginAttempt.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Events/Security/User/UserFailedLoginAttempt.php)
 - [UserSuccessfullyLoggedIn.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Events/Security/User/UserSuccessfullyLoggedIn.php)
 - [UserLoggedInFromNewIpAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Events/Security/User/UserLoggedInFromNewIpAddress.php)
@@ -710,7 +914,7 @@ event(UserSuccessfullyLoggedIn)
 - [UserHasDisabledMFA.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Events/Security/User/UserHasDisabledMFA.php)
 - [UserHasGeneratedNewBackupCodes.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Events/Security/User/UserHasGeneratedNewBackupCodes.php)
 
-### 11.3 监听器类
+### 12.4 监听器类
 - [NotifiesUserAboutFailedLogin.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutFailedLogin.php)
 - [NotifiesOwnerAboutUnknownUser.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/System/NotifiesOwnerAboutUnknownUser.php)
 - [StoresNewIpAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/StoresNewIpAddress.php)
@@ -724,7 +928,7 @@ event(UserSuccessfullyLoggedIn)
 - [NotifiesUserAboutNewBackupCodes.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/NotifiesUserAboutNewBackupCodes.php)
 - [HandlesChangeOfUserEmailAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Listeners/Security/User/HandlesChangeOfUserEmailAddress.php)
 
-### 11.4 通知类
+### 12.5 通知类
 - [UserFailedLoginAttempt.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/Security/UserFailedLoginAttempt.php)
 - [MFAUsedBackupCodeNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/Security/MFAUsedBackupCodeNotification.php)
 - [MFABackupFewLeftNotification.php](file:///d:/fz/0601-2/solo-dogfeeding/code/45-firefly-iii/app/Notifications/Security/MFABackupFewLeftNotification.php)
@@ -736,7 +940,7 @@ event(UserSuccessfullyLoggedIn)
 
 ---
 
-## 12. 设计特点总结
+## 13. 设计特点总结
 
 1. **事件驱动架构**：使用 Laravel 事件系统实现松耦合，控制器只需触发事件，无需关心后续处理
 2. **自动发现机制**：通过类型提示自动匹配事件和监听器，无需手动注册
@@ -746,5 +950,9 @@ event(UserSuccessfullyLoggedIn)
 6. **历史记录**：IP历史记录保留6个月，MFA历史记录保留5分钟（防重放），便于审计和异常检测
 7. **分级警告**：MFA失败在3次和10次时分别发送警告；备份码剩余 ≤3 和 =0 时分别通知，渐进式提醒
 8. **级联触发**：备份码使用后，`removeFromBackupCodes()` 根据剩余数量级联触发不同级别的安全事件
-9. **会话安全缺口**：改密操作不自动注销其他会话、不触发事件、不发送通知，与邮箱变更操作的严谨处理形成对比
-10. **主动防御与被动通知的分工**：主动注销其他会话是"清除"动作，自动提醒是"告知"动作，两者互补但不联动
+9. **会话安全的三层机制认知差**：
+   - 框架层 `logoutOtherDevices()` 只做"密码重哈希+指纹同步"
+   - 中间件层缺少 `AuthenticateSession`，导致 password_hash 比对从未执行
+   - 请求层只有浏览器关闭/session过期才会让其他设备失效，与用户"点击按钮立即全部下线"的认知不一致
+10. **改密与会话处理不一致**：改密不自动注销其他会话、不触发事件、不发送通知，与邮箱变更操作的严谨处理形成明显对比
+11. **主动防御与被动通知的分工**：主动注销其他会话试图做"清除"动作（但实际效果有限），自动提醒是"告知"动作（100%确定送达），两者互补但均不能单独解决"账户被盗后立即止损"的问题
